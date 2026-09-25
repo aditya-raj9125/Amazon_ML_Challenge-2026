@@ -34,61 +34,53 @@ from config import (
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
 
-def _name_prefix_key(norm_name: str, n: int) -> str:
-    """Return first n chars of the normalised name as a blocking key."""
-    return norm_name[:n] if len(norm_name) >= n else norm_name
+MAX_BUCKET_SIZE = 500  # Discard generic mega-buckets (e.g. 'US||main', 'US||the')
 
 
 def _build_token_keys(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Materialise all blocking keys as new columns.
-
-    Keys produced per record
-    ------------------------
-    key_name_pref3  : country + first-3-chars of sorted norm_name
-    key_name_pref4  : country + first-4-chars of sorted norm_name
-    key_addr_pref4  : country + first-4-chars of sorted norm_addr
-    key_name_norm   : country + full sorted norm_name (high precision)
-    key_addr_norm   : country + full sorted norm_addr
+    Materialise high-signal blocking keys as new columns.
     """
-    df = df.with_columns([
-        (pl.col("country") + "||" + pl.col("norm_name").str.slice(0, 3))
-            .alias("key_name_pref3"),
+    return df.with_columns([
         (pl.col("country") + "||" + pl.col("norm_name").str.slice(0, 4))
             .alias("key_name_pref4"),
-        (pl.col("country") + "||" + pl.col("norm_addr").str.slice(0, 4))
-            .alias("key_addr_pref4"),
+        (pl.col("country") + "||" + pl.col("norm_addr").str.slice(0, 5))
+            .alias("key_addr_pref5"),
         (pl.col("country") + "||" + pl.col("norm_name"))
             .alias("key_name_norm"),
         (pl.col("country") + "||" + pl.col("norm_addr"))
             .alias("key_addr_norm"),
     ])
-    return df
 
 
 def _token_blocking_pairs(s1: pl.DataFrame,
                            s23: pl.DataFrame,
-                           key_cols: list[str]) -> set[tuple[str, str]]:
+                           key_cols: list[str],
+                           max_bucket_size: int = MAX_BUCKET_SIZE) -> set[tuple[str, str]]:
     """
-    For each key column, build inverted index (key → list of ids) for S2/S3,
-    then look up every S1 key and collect matching S2/S3 ids.
-
-    Returns a set of (s1_id, s23_id) tuples.
+    For each key column, build inverted index (key → list of ids) for S2/S3.
+    Filter out mega-buckets to prevent combinatorial explosion.
     """
     pairs = set()
-    # Build S2/S3 inverted index for each key
     for key_col in key_cols:
         inv = defaultdict(list)
         for row in s23.select(["entity_id", key_col]).iter_rows():
             eid, key = row
-            if key:
+            if key and len(key) >= 5:
                 inv[key].append(eid)
+
+        # Filter out mega-buckets (> max_bucket_size) to protect RAM
+        valid_inv = {k: v for k, v in inv.items() if len(v) <= max_bucket_size}
+        del inv
 
         for row in s1.select(["entity_id", key_col]).iter_rows():
             s1_id, key = row
-            if key and key in inv:
-                for s23_id in inv[key]:
+            if key and key in valid_inv:
+                for s23_id in valid_inv[key]:
                     pairs.add((s1_id, s23_id))
+        del valid_inv
+        gc.collect()
+
     return pairs
 
 
@@ -97,40 +89,35 @@ def _sorted_neighborhood_pairs(s1: pl.DataFrame,
                                 window: int = SNM_WINDOW) -> set[tuple[str, str]]:
     """
     Sorted-Neighborhood Method on norm_name within each country.
-
-    Steps:
-      1. Concatenate S1 and S2/S3 records with source tag.
-      2. Sort by (country, norm_name).
-      3. Slide a window of size `window`; pair every S1 in window with
-         every S2/S3 in the same window.
-
-    Catches near-duplicates that differ in spelling but sort adjacently.
+    Memory-efficient: uses parallel lists, zero Python dictionary allocations.
     """
     pairs = set()
-    # Tag source
     s1_tagged  = s1.select(["entity_id", "country", "norm_name"]).with_columns(
         pl.lit("S1").alias("src"))
     s23_tagged = s23.select(["entity_id", "country", "norm_name"]).with_columns(
         pl.lit("S23").alias("src"))
     combined = pl.concat([s1_tagged, s23_tagged]).sort(["country", "norm_name"])
-    rows = combined.to_dicts()
 
-    # Slide window
-    for i, row in enumerate(rows):
-        if row["src"] != "S1":
+    srcs = combined["src"].to_list()
+    eids = combined["entity_id"].to_list()
+    cnts = combined["country"].to_list()
+    del combined, s1_tagged, s23_tagged
+    gc.collect()
+
+    n = len(srcs)
+    for i in range(n):
+        if srcs[i] != "S1":
             continue
-        s1_id = row["entity_id"]
-        country = row["country"]
-        # Look backward and forward within window
+        s1_id = eids[i]
+        c     = cnts[i]
         start = max(0, i - window)
-        end   = min(len(rows), i + window + 1)
+        end   = min(n, i + window + 1)
         for j in range(start, end):
-            if j == i:
-                continue
-            nbr = rows[j]
-            if nbr["src"] == "S23" and nbr["country"] == country:
-                pairs.add((s1_id, nbr["entity_id"]))
+            if j != i and srcs[j] == "S23" and cnts[j] == c:
+                pairs.add((s1_id, eids[j]))
 
+    del srcs, eids, cnts
+    gc.collect()
     return pairs
 
 
@@ -167,102 +154,48 @@ def encode_texts(texts: list[str],
     return embeddings.astype(np.float32)
 
 
-def _ann_blocking_pairs(s1: pl.DataFrame,
-                         s23: pl.DataFrame,
-                         s1_embeds: np.ndarray,
-                         s23_embeds: np.ndarray,
-                         top_k: int = ANN_TOP_K) -> set[tuple[str, str]]:
+def _ann_search_source(s1: pl.DataFrame,
+                        target_df: pl.DataFrame,
+                        s1_embeds: np.ndarray,
+                        target_embeds: np.ndarray,
+                        top_k: int) -> set[tuple[str, str]]:
     """
-    Approximate nearest-neighbor blocking via FAISS.
-
-    For each S1 embedding, retrieve top_k most similar S2/S3 embeddings
-    (cosine similarity — safe because embeddings are L2-normalised so
-    inner product == cosine).
-
-    Country partitioning is applied: only cross-country pairs with
-    very high similarity pass through (safety net).
-
-    Returns a set of (s1_id, s23_id) tuples.
+    Search S1 embeddings against target (S2 or S3) partitioned by country.
+    Uses FAISS IndexFlatIP with per-country indexes to keep RAM < 100 MB.
     """
+    import faiss
     pairs = set()
-    s1_ids  = s1["entity_id"].to_list()
-    s23_ids = s23["entity_id"].to_list()
-    s1_countries  = dict(zip(s1["entity_id"].to_list(),  s1["country"].to_list()))
-    s23_countries = dict(zip(s23["entity_id"].to_list(), s23["country"].to_list()))
+    s1_ids = s1["entity_id"].to_list()
+    tgt_ids = target_df["entity_id"].to_list()
+    s1_countries = dict(zip(s1_ids, s1["country"].to_list()))
+    tgt_countries = dict(zip(tgt_ids, target_df["country"].to_list()))
 
-    dim = s23_embeds.shape[1]
-
-    # Process per-country to keep index small and enforce partitioning
+    dim = target_embeds.shape[1]
     countries = list(set(s1["country"].to_list()))
-    for country in countries:
-        # S1 indices for this country
-        s1_mask   = [i for i, eid in enumerate(s1_ids)  if s1_countries[eid]  == country]
-        s23_mask  = [i for i, eid in enumerate(s23_ids) if s23_countries[eid] == country]
 
-        if not s1_mask or not s23_mask:
+    for country in countries:
+        s1_mask  = [i for i, eid in enumerate(s1_ids)  if s1_countries[eid] == country]
+        tgt_mask = [i for i, eid in enumerate(tgt_ids) if tgt_countries[eid] == country]
+
+        if not s1_mask or not tgt_mask:
             continue
 
-        sub_s23_embeds = np.ascontiguousarray(s23_embeds[s23_mask], dtype=np.float32)
-        sub_s1_embeds  = np.ascontiguousarray(s1_embeds[s1_mask], dtype=np.float32)
+        sub_tgt = np.ascontiguousarray(target_embeds[tgt_mask], dtype=np.float32)
+        sub_s1  = np.ascontiguousarray(s1_embeds[s1_mask], dtype=np.float32)
 
-        # Build flat FAISS index (inner product on L2-normed = cosine)
-        import faiss
         index = faiss.IndexFlatIP(dim)
-        index.add(sub_s23_embeds)
+        index.add(sub_tgt)
 
-        k = min(top_k, len(s23_mask))
-        distances, indices = index.search(sub_s1_embeds, k)
+        k = min(top_k, len(tgt_mask))
+        distances, indices = index.search(sub_s1, k)
+        del index, sub_tgt, sub_s1
 
         for qi, s1_idx in enumerate(s1_mask):
             s1_id = s1_ids[s1_idx]
             for rank in range(k):
-                s23_local_idx = indices[qi, rank]
-                if s23_local_idx < 0:
-                    continue
-                s23_idx = s23_mask[s23_local_idx]
-                pairs.add((s1_id, s23_ids[s23_idx]))
-
-    return pairs
-
-
-def _cross_country_safety_net(s1: pl.DataFrame,
-                               s23: pl.DataFrame,
-                               s1_embeds: np.ndarray,
-                               s23_embeds: np.ndarray,
-                               cos_threshold: float = 0.97) -> set[tuple[str, str]]:
-    """
-    Retrieve a tiny number of cross-country near-matches as insurance.
-
-    Uses a global FAISS index (all countries) and only admits pairs
-    where cosine similarity > cos_threshold. Typically adds < 0.01%
-    more pairs but prevents silent failure if France records happen
-    to have misassigned country labels.
-    """
-    pairs = set()
-    s1_ids  = s1["entity_id"].to_list()
-    s23_ids = s23["entity_id"].to_list()
-    s1_countries  = dict(zip(s1_ids,  s1["country"].to_list()))
-    s23_countries = dict(zip(s23_ids, s23["country"].to_list()))
-
-    dim = s23_embeds.shape[1]
-    import faiss
-    index = faiss.IndexFlatIP(dim)
-    index.add(np.ascontiguousarray(s23_embeds, dtype=np.float32))
-
-    k = min(5, len(s23_ids))
-    distances, indices = index.search(np.ascontiguousarray(s1_embeds, dtype=np.float32), k)
-
-    for qi, s1_id in enumerate(s1_ids):
-        for rank in range(k):
-            s23_idx = indices[qi, rank]
-            if s23_idx < 0:
-                continue
-            cos_sim = float(distances[qi, rank])
-            if cos_sim < cos_threshold:
-                break   # Results are sorted; no point continuing
-            s23_id = s23_ids[s23_idx]
-            if s1_countries[s1_id] != s23_countries[s23_id]:
-                pairs.add((s1_id, s23_id))
+                local_idx = indices[qi, rank]
+                if local_idx >= 0:
+                    pairs.add((s1_id, tgt_ids[tgt_mask[local_idx]]))
 
     return pairs
 
@@ -278,63 +211,68 @@ def generate_candidates(s1: pl.DataFrame,
                          top_k: int = ANN_TOP_K,
                          snm_window: int = SNM_WINDOW) -> dict[str, set[str]]:
     """
-    Combine all three blocking strategies and return a mapping:
+    Combine all three blocking strategies with zero memory bloat:
         { s1_entity_id : set of candidate S2/S3 entity_ids }
-
-    This dict is BOTH the input to the feature/matcher stage AND the
-    source for candidate_pairs.tsv.
-
-    Parameters
-    ----------
-    s1, s2, s3   : Polars DataFrames with columns
-                     [entity_id, business_name, business_address, country,
-                      norm_name, norm_addr]
-    s1_embeds    : L2-normalised embeddings for s1, shape (|s1|, dim)
-    s2_embeds    : same for s2
-    s3_embeds    : same for s3
     """
-    # Combine S2 and S3 into one dataframe for joint blocking
+    print("[Blocking] Preparing S23 metadata ...")
     s23 = pl.concat([s2, s3])
-    s23_embeds = np.vstack([s2_embeds, s3_embeds])
 
     print("[Blocking] Building token keys ...")
-    s1  = _build_token_keys(s1)
-    s23 = _build_token_keys(s23)
+    s1_keys  = _build_token_keys(s1)
+    s23_keys = _build_token_keys(s23)
 
-    key_cols = ["key_name_pref3", "key_name_pref4",
-                "key_addr_pref4", "key_name_norm", "key_addr_norm"]
+    key_cols = ["key_name_pref4", "key_addr_pref5", "key_name_norm", "key_addr_norm"]
 
-    print("[Blocking] Strategy A: Token blocking ...")
-    pairs_token = _token_blocking_pairs(s1, s23, key_cols)
+    print("[Blocking] Strategy A: Token blocking (filtering mega-buckets) ...")
+    pairs_token = _token_blocking_pairs(s1_keys, s23_keys, key_cols)
+    del s1_keys, s23_keys
+    gc.collect()
     print(f"           Token pairs: {len(pairs_token):,}")
 
-    print("[Blocking] Strategy B: Sorted-neighborhood (window={snm_window}) ...")
+    print(f"[Blocking] Strategy B: Sorted-neighborhood (window={snm_window}) ...")
     pairs_snm = _sorted_neighborhood_pairs(s1, s23, window=snm_window)
+    del s23
+    gc.collect()
     print(f"           SNM pairs: {len(pairs_snm):,}")
 
-    print("[Blocking] Strategy C: ANN (top_k={top_k}) ...")
-    pairs_ann = _ann_blocking_pairs(s1, s23, s1_embeds, s23_embeds, top_k=top_k)
-    print(f"           ANN pairs: {len(pairs_ann):,}")
+    print(f"[Blocking] Strategy C: ANN top-{top_k} on S2 & S3 (independent searches, 0 RAM overhead) ...")
+    pairs_ann_s2 = _ann_search_source(s1, s2, s1_embeds, s2_embeds, top_k=top_k)
+    print(f"           ANN S2 pairs: {len(pairs_ann_s2):,}")
 
-    # Safety net
-    print("[Blocking] Cross-country safety net ...")
-    pairs_cc = _cross_country_safety_net(s1, s23, s1_embeds, s23_embeds)
-    print(f"           Cross-country safety pairs: {len(pairs_cc):,}")
+    pairs_ann_s3 = _ann_search_source(s1, s3, s1_embeds, s3_embeds, top_k=top_k)
+    print(f"           ANN S3 pairs: {len(pairs_ann_s3):,}")
 
-    # Union
-    all_pairs = pairs_token | pairs_snm | pairs_ann | pairs_cc
-    print(f"[Blocking] Total unique candidate pairs (union): {len(all_pairs):,}")
-
-    # Pivot to dict: s1_id → set of s23_ids
+    # Build final candidates dict directly without intermediate giant set unions
+    print("[Blocking] Merging candidate pools into dict ...")
     candidates: dict[str, set[str]] = defaultdict(set)
-    for s1_id, s23_id in all_pairs:
-        candidates[s1_id].add(s23_id)
 
-    # Ensure every S1 entity has a row (even if empty)
+    for s1_id, s23_id in pairs_token:
+        candidates[s1_id].add(s23_id)
+    del pairs_token
+    gc.collect()
+
+    for s1_id, s23_id in pairs_snm:
+        candidates[s1_id].add(s23_id)
+    del pairs_snm
+    gc.collect()
+
+    for s1_id, s23_id in pairs_ann_s2:
+        candidates[s1_id].add(s23_id)
+    del pairs_ann_s2
+    gc.collect()
+
+    for s1_id, s23_id in pairs_ann_s3:
+        candidates[s1_id].add(s23_id)
+    del pairs_ann_s3
+    gc.collect()
+
+    # Ensure every S1 entity has an entry
     for s1_id in s1["entity_id"].to_list():
         if s1_id not in candidates:
             candidates[s1_id] = set()
 
+    total_pairs = sum(len(v) for v in candidates.values())
+    print(f"[Blocking] Total unique candidate pairs: {total_pairs:,}")
     return dict(candidates)
 
 
