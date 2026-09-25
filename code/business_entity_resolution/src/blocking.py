@@ -378,11 +378,9 @@ def generate_candidates(s1: pl.DataFrame,
     _add_prefix_matches(candidates, s1, s3, "norm_addr", prefix_len=6, max_bucket_size=50)
     print(f"           Pairs after Strategy A: {sum(len(v) for v in candidates.values()):,}")
 
-    print(f"[Blocking] Strategy B: Vectorized sorted-neighborhood (window={snm_window}) ...")
-    _add_snm_matches(candidates, s1, s2, col="norm_name", window=snm_window)
-    _add_snm_matches(candidates, s1, s3, col="norm_name", window=snm_window)
-    _add_snm_matches(candidates, s1, s2, col="norm_name_ns", window=snm_window)
-    _add_snm_matches(candidates, s1, s3, col="norm_name_ns", window=snm_window)
+    print(f"[Blocking] Strategy B: Vectorized sorted-neighborhood (window=2) ...")
+    _add_snm_matches(candidates, s1, s2, col="norm_name", window=2)
+    _add_snm_matches(candidates, s1, s3, col="norm_name", window=2)
     print(f"           Pairs after Strategy B: {sum(len(v) for v in candidates.values()):,}")
 
     ann_k = max(30, top_k)
