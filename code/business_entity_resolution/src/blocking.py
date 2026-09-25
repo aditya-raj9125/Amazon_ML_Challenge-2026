@@ -22,7 +22,6 @@ from collections import defaultdict
 
 import numpy as np
 import polars as pl
-import faiss
 from tqdm import tqdm
 
 from normalize import normalize_name, normalize_address
@@ -205,6 +204,7 @@ def _ann_blocking_pairs(s1: pl.DataFrame,
         sub_s1_embeds  = s1_embeds[s1_mask]
 
         # Build flat FAISS index (inner product on L2-normed = cosine)
+        import faiss
         index = faiss.IndexFlatIP(dim)
         index.add(sub_s23_embeds)
 
