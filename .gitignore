@@ -1,0 +1,56 @@
+# ── Model artifacts & cached embeddings ───────────────────────────────────────
+# These are large binary files that should NOT be committed.
+# Regenerate them by running the notebook from Cell 5 onward.
+code/business_entity_resolution/artifacts/
+
+# ── Output submission files ────────────────────────────────────────────────────
+# Generated at the end of the pipeline — upload directly to the portal.
+output/
+
+# ── Dataset files ─────────────────────────────────────────────────────────────
+# TSV and Parquet data files — too large for GitHub (2.5 GB total).
+# Download from the HuggingFace mirror:
+#   huggingface-cli download akshatbakshi/amazon-ml-challenge-2026 \
+#     --repo-type dataset --local-dir ./dataset
+dataset/
+
+# ── Python cache ──────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# ── Jupyter checkpoints ───────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# ── Virtual environments ──────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── OS files ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+
+# ── NumPy embedding cache (redundant with artifacts/ but explicit) ─────────────
+*.npy
+
+# ── Pickle files ──────────────────────────────────────────────────────────────
+*.pkl
+*.pickle
+
+# ── Temporary scratch files ───────────────────────────────────────────────────
+tmp/
+scratch/
