@@ -152,11 +152,9 @@ CROSS_COUNTRY_ADDR_THRESH = 0.90
 
 # ─── Embedding Model ──────────────────────────────────────────────────────────
 # MIT-licensed, multilingual (handles Hindi-transliteration + French).
-# ~117M params — well under the 8B cap.
-# L6 is 2x faster than L12 with negligible quality drop for similarity search.
-# Both are MIT licensed, 384-dim output, multilingual (Hindi + French).
-EMBED_MODEL_NAME    = "sentence-transformers/paraphrase-multilingual-MiniLM-L6-v2"
-EMBED_BATCH_SIZE    = 1024      # fp16 uses half memory → double the batch size vs fp32
+# ~117M params — well under the 8B cap. 384-dim output.
+EMBED_MODEL_NAME    = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+EMBED_BATCH_SIZE    = 512       # 512 fits comfortably in 16GB VRAM with fp16
 EMBED_MAX_SEQ_LEN   = 128       # name + address is usually < 80 tokens
 
 # ─── TF-IDF ───────────────────────────────────────────────────────────────────
