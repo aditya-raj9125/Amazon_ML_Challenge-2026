@@ -175,11 +175,12 @@ def _add_ann_matches(candidates: dict[str, set[str]],
                      s1_embeds: np.ndarray,
                      target_embeds: np.ndarray,
                      top_k: int = 15,
-                     batch_size: int = 4096):
+                     max_sim_bytes: int = 512 * 1024 * 1024):
     """
     Search S1 embeddings against target (S2 or S3) partitioned by country.
-    Uses PyTorch matrix multiplication & topk (GPU with FP16 if available, CPU if not).
-    Eliminates FAISS NumPy 1.x/2.x ABI incompatibility, runs in < 5 seconds with < 500 MB RAM.
+    Uses PyTorch matrix multiplication & topk with dynamic query batch sizing.
+    The similarity matrix is capped at max_sim_bytes (default 512 MB VRAM),
+    completely preventing CUDA OutOfMemoryError.
     """
     import torch
 
@@ -205,54 +206,92 @@ def _add_ann_matches(candidates: dict[str, set[str]],
         if not tgt_idx_list:
             continue
 
+        n_tgt = len(tgt_idx_list)
+        n_queries = len(s1_idx_list)
+        k = min(top_k, n_tgt)
+
+        country_tgt_ids = [tgt_ids[i] for i in tgt_idx_list]
         tgt_idx_arr = np.array(tgt_idx_list, dtype=np.int64)
-        sub_tgt = target_embeds[tgt_idx_arr]
-
-        # Convert target embeddings to torch tensor
-        # sub_tgt is L2-normalized, shape: (N_tgt, dim)
-        sub_tgt_f32 = sub_tgt.astype(np.float32) if sub_tgt.dtype != np.float32 else sub_tgt
-        tgt_t = torch.from_numpy(sub_tgt_f32)
-        del sub_tgt, sub_tgt_f32
-
-        if use_fp16:
-            tgt_t = tgt_t.half()
-        tgt_t = tgt_t.to(device)
-
-        # Transpose to (dim, N_tgt) for dot product
-        tgt_t_T = tgt_t.t().contiguous()
-        del tgt_t
-
-        k = min(top_k, len(tgt_idx_list))
         s1_idx_arr = np.array(s1_idx_list, dtype=np.int64)
-        n_queries = len(s1_idx_arr)
 
-        for b_start in range(0, n_queries, batch_size):
-            b_end = min(b_start + batch_size, n_queries)
-            b_indices = s1_idx_arr[b_start:b_end]
-            b_embs = s1_embeds[b_indices]
+        # Dynamic query batch size so (batch_size * n_tgt * element_size) <= max_sim_bytes
+        elem_bytes = 2 if use_fp16 else 4
+        safe_batch_size = max(32, min(512, int(max_sim_bytes / (n_tgt * elem_bytes))))
+        vram_mb = int(safe_batch_size * n_tgt * elem_bytes / (1024 * 1024))
+        print(f"           [{country}] {n_queries:,} queries vs {n_tgt:,} targets (batch={safe_batch_size}, ~{vram_mb} MB VRAM) ...")
 
-            b_embs_f32 = b_embs.astype(np.float32) if b_embs.dtype != np.float32 else b_embs
-            q_t = torch.from_numpy(b_embs_f32)
-            del b_embs, b_embs_f32
-
+        try:
+            # Load target embeddings directly in float16/float32
+            sub_tgt = target_embeds[tgt_idx_arr]
             if use_fp16:
-                q_t = q_t.half()
-            q_t = q_t.to(device)
+                sub_tgt_arr = sub_tgt.astype(np.float16) if sub_tgt.dtype != np.float16 else sub_tgt
+                tgt_t = torch.from_numpy(sub_tgt_arr).half().to(device)
+            else:
+                sub_tgt_arr = sub_tgt.astype(np.float32) if sub_tgt.dtype != np.float32 else sub_tgt
+                tgt_t = torch.from_numpy(sub_tgt_arr).float().to(device)
+            del sub_tgt, sub_tgt_arr
 
-            # Cosine similarity dot-product: (batch_size, dim) @ (dim, N_tgt) -> (batch_size, N_tgt)
-            sim = torch.mm(q_t, tgt_t_T)
-            _, topk_local_idx = torch.topk(sim, k=k, dim=1)
-            topk_np = topk_local_idx.cpu().numpy()
-            del sim, q_t, topk_local_idx
+            # Transpose to (dim, N_tgt) for dot product
+            tgt_t_T = tgt_t.t().contiguous()
+            del tgt_t
 
-            for qi, s1_orig_idx in enumerate(b_indices):
-                s1_id = s1_ids[s1_orig_idx]
-                matched_tgt_ids = [tgt_ids[tgt_idx_arr[loc]] for loc in topk_np[qi] if loc >= 0]
-                candidates[s1_id].update(matched_tgt_ids)
+            for b_start in range(0, n_queries, safe_batch_size):
+                b_end = min(b_start + safe_batch_size, n_queries)
+                b_indices = s1_idx_arr[b_start:b_end]
+                b_embs = s1_embeds[b_indices]
 
-        del tgt_t_T
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+                if use_fp16:
+                    b_embs_arr = b_embs.astype(np.float16) if b_embs.dtype != np.float16 else b_embs
+                    q_t = torch.from_numpy(b_embs_arr).half().to(device)
+                else:
+                    b_embs_arr = b_embs.astype(np.float32) if b_embs.dtype != np.float32 else b_embs
+                    q_t = torch.from_numpy(b_embs_arr).float().to(device)
+                del b_embs, b_embs_arr
+
+                # Cosine similarity dot-product: (batch_size, dim) @ (dim, N_tgt) -> (batch_size, N_tgt)
+                sim = torch.mm(q_t, tgt_t_T)
+                _, topk_local_idx = torch.topk(sim, k=k, dim=1)
+                topk_np = topk_local_idx.cpu().numpy()
+                del sim, q_t, topk_local_idx
+
+                for qi, s1_orig_idx in enumerate(b_indices):
+                    s1_id = s1_ids[s1_orig_idx]
+                    candidates[s1_id].update(country_tgt_ids[loc] for loc in topk_np[qi] if loc >= 0)
+
+            del tgt_t_T
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        except torch.cuda.OutOfMemoryError:
+            print(f"           [Warning] CUDA OOM for {country}, falling back to CPU ...")
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
+
+            sub_tgt = target_embeds[tgt_idx_arr]
+            tgt_t_cpu = torch.from_numpy(sub_tgt.astype(np.float32)).t().contiguous()
+            del sub_tgt
+
+            cpu_batch = 128
+            for b_start in range(0, n_queries, cpu_batch):
+                b_end = min(b_start + cpu_batch, n_queries)
+                b_indices = s1_idx_arr[b_start:b_end]
+                b_embs = s1_embeds[b_indices]
+                q_t = torch.from_numpy(b_embs.astype(np.float32))
+                del b_embs
+
+                sim = torch.mm(q_t, tgt_t_cpu)
+                _, topk_local_idx = torch.topk(sim, k=k, dim=1)
+                topk_np = topk_local_idx.numpy()
+                del sim, q_t, topk_local_idx
+
+                for qi, s1_orig_idx in enumerate(b_indices):
+                    s1_id = s1_ids[s1_orig_idx]
+                    candidates[s1_id].update(country_tgt_ids[loc] for loc in topk_np[qi] if loc >= 0)
+
+            del tgt_t_cpu
+            gc.collect()
+
         gc.collect()
 
 
