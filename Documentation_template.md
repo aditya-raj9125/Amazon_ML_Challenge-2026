@@ -26,7 +26,7 @@ Raw TSVs
    ↓
 [Text Normalisation]
    ↓
-[Multilingual Encoding — paraphrase-multilingual-MiniLM-L12-v2]
+[Multilingual Encoding — paraphrase-multilingual-MiniLM-L6-v2]
    ↓
 [Blocking / Candidate Generation]
    ├── A. Token blocking (name/address prefix keys)
@@ -69,7 +69,7 @@ Two records are candidate pairs if they share any key. EDA: `name_normalized` ke
 Records sorted by (country, norm_name). Sliding window of width 5 pairs every S1 in the window with every S2/S3 in the same window. Catches near-duplicates that sort adjacently but differ by prefix characters (typos, abbreviation variation).
 
 ### Strategy C — FAISS ANN
-Embeddings from `paraphrase-multilingual-MiniLM-L12-v2` (MIT license, 117M params).
+Embeddings from `paraphrase-multilingual-MiniLM-L6-v2` (MIT license, 22M params).
 Per-country FAISS `IndexFlatIP` (inner product on L2-normalised vectors = cosine).
 Top-30 nearest S2/S3 retrieved per S1. This is the only strategy that handles:
 - Hindi-transliteration variants (Devanagari ↔ Latin)
@@ -144,7 +144,7 @@ All features are **language-agnostic** — defined on similarity scores, not raw
 - Negatives = hard negatives from same blocking bucket (not random)
 - Ratio: 8 negatives per positive (hard negatives most informative for the boundary)
 
-### Bi-encoder Role (paraphrase-multilingual-MiniLM-L12-v2)
+### Bi-encoder Role (paraphrase-multilingual-MiniLM-L6-v2)
 Used in **two** ways — never as the final classifier:
 1. Blocking recall layer (FAISS ANN, top-30)
 2. `embed_cosine` feature into LightGBM

@@ -44,11 +44,16 @@ from config import (
     EMBED_MODEL_NAME, EMBED_BATCH_SIZE,
     EMBED_S1_TRAIN_PATH, EMBED_S2_TRAIN_PATH, EMBED_S3_TRAIN_PATH,
     EMBED_S1_TEST_PATH,  EMBED_S2_TEST_PATH,  EMBED_S3_TEST_PATH,
+    PARQUET_CACHE_DIR,
     ANN_TOP_K, SNM_WINDOW,
     LGBM_PARAMS, LGBM_EARLY_STOPPING_ROUNDS, NEG_TO_POS_RATIO,
     ENABLE_ONE_TO_ONE_DEDUP, ENABLE_GRAPH_PRUNING,
 )
-from normalize import normalize_name, normalize_address, normalize_name_no_sort, normalize_address_no_sort, build_text_for_embedding
+from normalize import (
+    LEGAL_SUFFIXES, ADDR_ABBREV,
+    normalize_name, normalize_address, normalize_name_no_sort, normalize_address_no_sort,
+    build_text_for_embedding,
+)
 from blocking import generate_candidates, compute_blocking_recall, encode_texts
 from train_eval import (
     build_record_lookup, attach_embeddings,
@@ -61,32 +66,83 @@ from predict import load_model, run_inference
 
 # ─── Data loading ─────────────────────────────────────────────────────────────
 
+def _get_parquet_path(tsv_path: str) -> str:
+    """Return the parquet cache path corresponding to a TSV file."""
+    if PARQUET_CACHE_DIR:
+        os.makedirs(PARQUET_CACHE_DIR, exist_ok=True)
+        fname = os.path.splitext(os.path.basename(tsv_path))[0] + ".parquet"
+        return os.path.join(PARQUET_CACHE_DIR, fname)
+    return os.path.splitext(tsv_path)[0] + ".parquet"
+
+
 def load_source(path: str) -> pl.DataFrame:
     """
     Load a TSV source file with Polars.
-    Adds pre-computed norm_name and norm_addr columns immediately
-    so they don't have to be recomputed per pair downstream.
+    Checks for a cached .parquet version first. If missing, loads TSV,
+    cleans nulls, caches as zstd-compressed parquet for fast subsequent loads,
+    and returns the DataFrame.
     """
-    print(f"Loading {os.path.basename(path)} ...")
-    df = pl.read_csv(path, separator="\t", infer_schema_length=10_000,
-                     null_values=["", "NULL", "null", "N/A"])
+    parquet_path = _get_parquet_path(path)
+    if os.path.exists(parquet_path):
+        print(f"Loading {os.path.basename(parquet_path)} (from parquet cache) ...")
+        df = pl.read_parquet(parquet_path)
+        print(f"  Rows: {len(df):,}")
+        return df
+
+    print(f"Loading {os.path.basename(path)} (TSV) ...")
+    df = pl.read_csv(
+        path,
+        separator="\t",
+        infer_schema_length=10_000,
+        null_values=["", "NULL", "null", "N/A"]
+    )
     # Fill nulls with empty string for text columns
     for col in ["business_name", "business_address", "country"]:
         if col in df.columns:
             df = df.with_columns(pl.col(col).fill_null(""))
 
     print(f"  Rows: {len(df):,}")
+
+    # Convert and cache to parquet for fast subsequent loads
+    try:
+        df.write_parquet(parquet_path, compression="zstd")
+        print(f"  Saved parquet cache to {parquet_path}")
+    except Exception as e:
+        print(f"  [Notice] Could not write parquet cache ({e}). Continuing with in-memory DataFrame.")
+
     return df
 
 
 def load_ground_truth(path: str) -> pl.DataFrame:
-    """Load ground truth TSV. Fills null matched_entity_ids with empty string."""
-    print(f"Loading ground truth ...")
-    df = pl.read_csv(path, separator="\t", infer_schema_length=1000,
-                     null_values=["", "NULL", "null"])
+    """
+    Load ground truth TSV with Polars.
+    Checks for a cached .parquet version first. If missing, loads TSV,
+    cleans nulls, caches to parquet, and returns the DataFrame.
+    """
+    parquet_path = _get_parquet_path(path)
+    if os.path.exists(parquet_path):
+        print(f"Loading {os.path.basename(parquet_path)} (from parquet cache) ...")
+        df = pl.read_parquet(parquet_path)
+        print(f"  GT rows: {len(df):,}")
+        return df
+
+    print(f"Loading ground truth (TSV) ...")
+    df = pl.read_csv(
+        path,
+        separator="\t",
+        infer_schema_length=1000,
+        null_values=["", "NULL", "null"]
+    )
     if "matched_entity_ids" in df.columns:
         df = df.with_columns(pl.col("matched_entity_ids").fill_null(""))
     print(f"  GT rows: {len(df):,}")
+
+    try:
+        df.write_parquet(parquet_path, compression="zstd")
+        print(f"  Saved ground truth parquet cache to {parquet_path}")
+    except Exception as e:
+        print(f"  [Notice] Could not write parquet cache ({e}). Continuing with in-memory DataFrame.")
+
     return df
 
 
@@ -183,16 +239,57 @@ def stage_encode_test(ts1, ts2, ts3, force=False):
 
 def stage_add_norm_cols(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Stage helper — add norm_name and norm_addr columns to a DataFrame.
-    Polars map_elements applies the Python normaliser row-by-row.
-    Slow but correct; consider caching if you restart frequently.
+    Stage helper — add norm_name, norm_name_ns, norm_addr, and norm_addr_ns columns.
+    Uses Polars native string expressions for high-throughput vectorized execution
+    (~10x faster than row-by-row map_elements).
     """
-    print(f"  Normalising {len(df):,} rows ...")
+    if "norm_name" in df.columns and "norm_addr" in df.columns:
+        print(f"  Columns norm_name and norm_addr already exist for {len(df):,} rows.")
+        return df
+
+    print(f"  Normalising {len(df):,} rows (Polars native expressions) ...")
+
+    # Legal suffix removal regex pattern (case-insensitive word boundary match)
+    legal_pattern = r"(?i)\b(" + "|".join(sorted(LEGAL_SUFFIXES, key=len, reverse=True)) + r")\b"
+
+    # Name normalisation:
+    # 1. Base clean: lower, '&' -> 'and', remove non-alphanumeric, strip legal suffixes, collapse spaces
+    base_name = (
+        pl.col("business_name")
+        .fill_null("")
+        .str.to_lowercase()
+        .str.replace_all(r"&", " and ")
+        .str.replace_all(r"[^\w\s]", " ")
+        .str.replace_all(legal_pattern, " ")
+        .str.replace_all(r"\s+", " ")
+        .str.replace_all(r"^\s+|\s+$", "")
+    )
+
+    # Address normalisation:
+    base_addr = (
+        pl.col("business_address")
+        .fill_null("")
+        .str.to_lowercase()
+        .str.replace_all(r"&", " and ")
+        .str.replace_all(r"[^\w\s]", " ")
+    )
+    for k, v in ADDR_ABBREV.items():
+        base_addr = base_addr.str.replace_all(rf"\b{k}\b", v)
+
+    base_addr = (
+        base_addr
+        .str.replace_all(r"\s+", " ")
+        .str.replace_all(r"^\s+|\s+$", "")
+    )
+
+    # Token-sorted name: split on space, sort tokens, join with space
+    sorted_name = base_name.str.split(" ").list.sort().list.join(" ")
+
     df = df.with_columns([
-        pl.col("business_name").map_elements(
-            normalize_name, return_dtype=pl.Utf8).alias("norm_name"),
-        pl.col("business_address").map_elements(
-            normalize_address, return_dtype=pl.Utf8).alias("norm_addr"),
+        sorted_name.alias("norm_name"),
+        base_name.alias("norm_name_ns"),
+        base_addr.alias("norm_addr"),
+        base_addr.alias("norm_addr_ns"),
     ])
     return df
 

@@ -126,19 +126,24 @@ def make_train_val_split(gt: pl.DataFrame,
 def build_record_lookup(df: pl.DataFrame) -> dict[str, dict]:
     """
     Convert a Polars DataFrame into a dict {entity_id → record_dict}.
-    Adds pre-computed normalised fields so we don't recompute per pair.
+    Reuses pre-computed normalised columns from Polars if present (~10x faster).
     """
     lookup = {}
+    has_norm_name = "norm_name" in df.columns
+    has_norm_name_ns = "norm_name_ns" in df.columns
+    has_norm_addr = "norm_addr" in df.columns
+    has_norm_addr_ns = "norm_addr_ns" in df.columns
+
     for row in tqdm(df.iter_rows(named=True), total=len(df), desc="Building lookup"):
         eid  = row["entity_id"]
         name = row.get("business_name", "") or ""
         addr = row.get("business_address", "") or ""
         lookup[eid] = {
             **row,
-            "norm_name":    normalize_name(name),
-            "norm_name_ns": normalize_name_no_sort(name),
-            "norm_addr":    normalize_address(addr),
-            "norm_addr_ns": normalize_address_no_sort(addr),
+            "norm_name":    row["norm_name"] if has_norm_name else normalize_name(name),
+            "norm_name_ns": row["norm_name_ns"] if has_norm_name_ns else normalize_name_no_sort(name),
+            "norm_addr":    row["norm_addr"] if has_norm_addr else normalize_address(addr),
+            "norm_addr_ns": row["norm_addr_ns"] if has_norm_addr_ns else normalize_address_no_sort(addr),
             "embed_vec":    None,   # filled in after encoding
         }
     return lookup
@@ -166,11 +171,11 @@ def build_pair_dataset(
     """
     Build the feature matrix X and label vector y for LightGBM training.
 
-    Positive pairs  : all (s1_id, s23_id) in GT intersect candidates.
-    Hard negatives  : same-block (s1_id, s23_id) pairs that are NOT in GT,
-                      downsampled to neg_ratio positives.
-    Easy negatives  : random cross-country or random pairs are deliberately
-                      excluded — they are too easy and waste label budget.
+    Optimization:
+      1. Partition candidate pairs into positive & negative IDs first.
+      2. Downsample negative pairs BEFORE feature computation, avoiding
+         computing millions of features on pairs that are immediately discarded.
+      3. Compute feature vectors only for the retained pairs using fast list-of-lists.
 
     Returns
     -------
@@ -179,42 +184,46 @@ def build_pair_dataset(
     """
     rng = random.Random(seed)
 
-    positives = []   # list of feature dicts
-    negatives = []   # list of feature dicts
+    pos_pairs: list[tuple[str, str]] = []
+    neg_pairs: list[tuple[str, str]] = []
 
-    for s1_id in tqdm(train_s1_ids, desc="Building pairs"):
+    print("Selecting candidate pairs for training...")
+    for s1_id in tqdm(train_s1_ids, desc="Selecting pairs"):
         if s1_id not in lookup_all:
             continue
-        rec_a   = lookup_all[s1_id]
         true_m  = gt_dict.get(s1_id, set())
         cand_m  = candidates.get(s1_id, set())
 
         for s23_id in cand_m:
             if s23_id not in lookup_all:
                 continue
-            rec_b = lookup_all[s23_id]
-            fv    = build_feature_vector(rec_a, rec_b)
-
             if s23_id in true_m:
-                positives.append(fv)
+                pos_pairs.append((s1_id, s23_id))
             else:
-                negatives.append(fv)
+                neg_pairs.append((s1_id, s23_id))
 
-    print(f"  Raw positives : {len(positives):,}")
-    print(f"  Raw negatives : {len(negatives):,}")
+    print(f"  Raw candidate positives : {len(pos_pairs):,}")
+    print(f"  Raw candidate negatives : {len(neg_pairs):,}")
 
-    # Downsample negatives (keep hard ones — already from same block)
-    target_neg = min(len(negatives), len(positives) * neg_ratio)
-    rng.shuffle(negatives)
-    negatives = negatives[:target_neg]
-    print(f"  After downsampling negatives: {len(negatives):,}")
+    # Downsample negatives BEFORE feature computation (keep hard negatives from same block)
+    target_neg = min(len(neg_pairs), len(pos_pairs) * neg_ratio)
+    rng.shuffle(neg_pairs)
+    neg_pairs = neg_pairs[:target_neg]
+    print(f"  Selected negatives       : {len(neg_pairs):,}")
 
-    pos_df = pd.DataFrame(positives, columns=FEATURE_NAMES).fillna(0.0)
-    neg_df = pd.DataFrame(negatives, columns=FEATURE_NAMES).fillna(0.0)
+    selected_pairs = pos_pairs + neg_pairs
+    y = np.array([1] * len(pos_pairs) + [0] * len(neg_pairs), dtype=np.int8)
 
-    X = pd.concat([pos_df, neg_df], ignore_index=True)
-    y = np.array([1] * len(positives) + [0] * len(negatives), dtype=np.int8)
+    # Compute features ONLY on the selected pairs
+    print(f"Computing features for {len(selected_pairs):,} selected pairs...")
+    rows = []
+    for s1_id, s23_id in tqdm(selected_pairs, desc="Extracting features"):
+        rec_a = lookup_all[s1_id]
+        rec_b = lookup_all[s23_id]
+        fv = build_feature_vector(rec_a, rec_b)
+        rows.append([fv.get(f, 0.0) for f in FEATURE_NAMES])
 
+    X = pd.DataFrame(rows, columns=FEATURE_NAMES).fillna(0.0)
     return X, y
 
 

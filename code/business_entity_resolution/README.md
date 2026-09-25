@@ -182,7 +182,7 @@ Again: **only removes false positives, never introduces new ones**.
 → A bug in postprocess.py — run `stage_validate_submission()` and read the error list.
 
 **France records all predicted as singletons**
-→ Verify `paraphrase-multilingual-MiniLM-L12-v2` is loading correctly.
+→ Verify `paraphrase-multilingual-MiniLM-L6-v2` is loading correctly.
    Try `intfloat/multilingual-e5-small` as an alternative in `config.py`.
 
 ---
