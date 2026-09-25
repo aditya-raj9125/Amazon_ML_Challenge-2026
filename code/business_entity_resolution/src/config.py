@@ -6,56 +6,91 @@
 
 import os
 
+# ─── Repository Root ─────────────────────────────────────────────────────────
+# config.py is at: <REPO_ROOT>/code/business_entity_resolution/src/config.py
+# Going up 3 directory levels reaches the actual repository root.
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+
 # ─── Data Paths (Auto-detects Local / SageMaker vs Colab Drive) ───────────────
 def _find_data_root() -> str:
-    # 1. Check environment variable override
+    # 1. Environment variable override
     if "AMAZON_ML_DATA" in os.environ:
         env_path = os.environ["AMAZON_ML_DATA"]
         if os.path.exists(os.path.join(env_path, "train", "train_source1.tsv")):
             return env_path
         if os.path.basename(env_path) == "train" and os.path.exists(os.path.join(env_path, "train_source1.tsv")):
             return os.path.dirname(env_path)
+        if os.path.exists(env_path):
+            return env_path
 
-    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-
-    # 2. Search for the actual train_source1.tsv file inside the repository
-    for root, dirs, files in os.walk(repo_root):
-        # Skip hidden cache directories like .cache
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
-        if "train_source1.tsv" in files:
-            if os.path.basename(root) == "train":
-                return os.path.dirname(root)
-            return root
-
-    # 3. Fallbacks
-    candidate_paths = [
-        os.path.join(repo_root, "dataset"),
-        os.path.join(repo_root, "dataset", "student_resource", "dataset"),
-        os.path.join(repo_root, "dataset", "student_resource"),
-        os.path.join(repo_root, "dataset", "dataset"),
+    # 2. Check candidate directories in priority order
+    candidate_roots = [
+        os.path.join(REPO_ROOT, "dataset"),
+        os.path.join(REPO_ROOT, "Datasets"),
+        os.path.join(REPO_ROOT, "data"),
+        REPO_ROOT,
+        os.path.abspath(os.path.join(os.getcwd(), "..", "..")),
+        os.path.abspath(os.path.join(os.getcwd(), "dataset")),
+        os.path.abspath(os.getcwd()),
         "/content/drive/MyDrive/Amazon_ML_Challenge_2026/Datasets/student_resource/dataset",
     ]
-    for p in candidate_paths:
-        if os.path.exists(os.path.join(p, "train", "train_source1.tsv")):
-            return p
-    return candidate_paths[0]
+
+    for c in candidate_roots:
+        if os.path.exists(os.path.join(c, "train", "train_source1.tsv")):
+            return c
+        if os.path.exists(os.path.join(c, "train_source1.tsv")):
+            return c
+        nested = os.path.join(c, "student_resource", "dataset")
+        if os.path.exists(os.path.join(nested, "train", "train_source1.tsv")):
+            return nested
+
+    # 3. Deep search inside REPO_ROOT and current working directory
+    search_dirs = [REPO_ROOT, os.getcwd()]
+    for s_dir in search_dirs:
+        for root, dirs, files in os.walk(s_dir):
+            dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("__pycache__", "venv", ".venv")]
+            if "train_source1.tsv" in files:
+                if os.path.basename(root) == "train":
+                    return os.path.dirname(root)
+                return root
+
+    # Fallback default
+    return os.path.join(REPO_ROOT, "dataset")
 
 DATA_ROOT = _find_data_root()
 
-TRAIN_DIR = os.path.join(DATA_ROOT, "train")
-TEST_DIR  = os.path.join(DATA_ROOT, "test")
+# Determine TRAIN_DIR and TEST_DIR
+if os.path.exists(os.path.join(DATA_ROOT, "train")):
+    TRAIN_DIR = os.path.join(DATA_ROOT, "train")
+else:
+    TRAIN_DIR = DATA_ROOT
 
-TRAIN_S1  = os.path.join(TRAIN_DIR, "train_source1.tsv")
-TRAIN_S2  = os.path.join(TRAIN_DIR, "train_source2.tsv")
-TRAIN_S3  = os.path.join(TRAIN_DIR, "train_source3.tsv")
-TRAIN_GT  = os.path.join(TRAIN_DIR, "train_ground_truth.tsv")
+if os.path.exists(os.path.join(DATA_ROOT, "test")):
+    TEST_DIR = os.path.join(DATA_ROOT, "test")
+else:
+    TEST_DIR = DATA_ROOT
 
-TEST_S1   = os.path.join(TEST_DIR, "test_source1.tsv")
-TEST_S2   = os.path.join(TEST_DIR, "test_source2.tsv")
-TEST_S3   = os.path.join(TEST_DIR, "test_source3.tsv")
+# Resolve each file dynamically
+def _resolve_file(directory: str, filename: str) -> str:
+    direct = os.path.join(directory, filename)
+    if os.path.exists(direct):
+        return direct
+    parent = os.path.join(os.path.dirname(directory), filename)
+    if os.path.exists(parent):
+        return parent
+    return direct
+
+TRAIN_S1  = _resolve_file(TRAIN_DIR, "train_source1.tsv")
+TRAIN_S2  = _resolve_file(TRAIN_DIR, "train_source2.tsv")
+TRAIN_S3  = _resolve_file(TRAIN_DIR, "train_source3.tsv")
+TRAIN_GT  = _resolve_file(TRAIN_DIR, "train_ground_truth.tsv")
+
+TEST_S1   = _resolve_file(TEST_DIR, "test_source1.tsv")
+TEST_S2   = _resolve_file(TEST_DIR, "test_source2.tsv")
+TEST_S3   = _resolve_file(TEST_DIR, "test_source3.tsv")
 
 # ─── Output Paths ────────────────────────────────────────────────────────────
-OUTPUT_DIR          = os.path.join(os.path.dirname(__file__), "..", "..", "output")
+OUTPUT_DIR          = os.path.join(REPO_ROOT, "output")
 MATCHING_OUT        = os.path.join(OUTPUT_DIR, "matching_results.tsv")
 CANDIDATE_OUT       = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
 

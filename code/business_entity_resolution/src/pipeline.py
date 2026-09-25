@@ -492,16 +492,13 @@ def stage_validate_submission():
     Import and call validate() directly (no subprocess needed in Colab).
     """
     import importlib.util, sys
-    validator_path = os.path.join(
-        os.path.dirname(_SRC_DIR), "..", "..", "utils", "validate_submission.py"
-    )
-    validator_path = os.path.abspath(validator_path)
+    from config import REPO_ROOT, OUTPUT_DIR, TEST_S1
+    validator_path = os.path.abspath(os.path.join(REPO_ROOT, "utils", "validate_submission.py"))
 
     spec = importlib.util.spec_from_file_location("validate_submission", validator_path)
     mod  = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
 
-    from config import OUTPUT_DIR, TEST_S1
     test_dir = os.path.dirname(TEST_S1)
     matching  = os.path.join(OUTPUT_DIR, "matching_results.tsv")
     candidate = os.path.join(OUTPUT_DIR, "candidate_pairs.tsv")
