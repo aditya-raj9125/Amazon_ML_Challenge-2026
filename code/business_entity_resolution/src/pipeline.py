@@ -186,38 +186,27 @@ _EMBED_CHUNK_SIZE = 500_000
 
 
 def get_or_compute_embeddings(df: pl.DataFrame,
-                               save_path: str,
-                               force_recompute: bool = False) -> np.ndarray:
+                              save_path: str,
+                              force_recompute: bool = False) -> np.ndarray:
     """
     Load pre-computed embeddings from disk, or encode + cache with checkpointing.
 
-    CHECKPOINT BEHAVIOUR
-    ────────────────────
-    Encodes `_EMBED_CHUNK_SIZE` rows at a time and saves each chunk immediately
-    as a float16 .npy file in <save_path>.chunks/.  If the kernel is killed
-    mid-run, completed chunks survive on disk.  On the next call, those chunks
-    are loaded from cache and only missing chunks are re-encoded.
-
-    Once all chunks are done, they are merged into the final `save_path` file
-    and the chunk directory is deleted.
+    CHECKPOINT & STREAMING MERGE BEHAVIOUR
+    ──────────────────────────────────────
+    1. Encodes rows chunk-by-chunk (500K rows each).
+    2. Builds texts ON THE FLY per chunk using df.slice (zero RAM wasted).
+    3. Saves each chunk immediately as float16 .npy (~366 MB in <3s).
+    4. Merges chunks via memory-mapped streaming: 1 chunk in RAM at a time (<400 MB RAM peak).
+    5. Returns memory-mapped array (0 MB RAM footprint).
     """
     # ── Full cache hit ────────────────────────────────────────────────────
     if not force_recompute and os.path.exists(save_path):
-        print(f"Loading cached embeddings from {save_path} ...")
-        arr = np.load(save_path)
-        return arr.astype(np.float32) if arr.dtype == np.float16 else arr
+        print(f"Loading cached embeddings from {save_path} (mmap) ...")
+        return np.load(save_path, mmap_mode="r")
 
-    # ── Build text list ───────────────────────────────────────────────────
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    print(f"Building text list for {len(df):,} records ...")
-    texts = [
-        build_text_for_embedding(
-            row.get("business_name", "") or "",
-            row.get("business_address", "") or "",
-        )
-        for row in df.iter_rows(named=True)
-    ]
-    n = len(texts)
+    n = len(df)
+    dim = 384
     n_chunks = math.ceil(n / _EMBED_CHUNK_SIZE)
     chunk_dir = save_path + ".chunks"
     os.makedirs(chunk_dir, exist_ok=True)
@@ -226,55 +215,64 @@ def get_or_compute_embeddings(df: pl.DataFrame,
           f"(checkpoint after every chunk) ...")
 
     # ── Encode / load chunk by chunk ──────────────────────────────────────
-    all_chunks = []
     for ci in range(n_chunks):
         chunk_path = os.path.join(chunk_dir, f"chunk_{ci:04d}.npy")
 
         if not force_recompute and os.path.exists(chunk_path):
-            print(f"  [Chunk {ci+1}/{n_chunks}] Loading from checkpoint ...")
-            chunk_arr = np.load(chunk_path)
-            all_chunks.append(
-                chunk_arr if chunk_arr.dtype == np.float16 else chunk_arr.astype(np.float16)
-            )
+            print(f"  [Chunk {ci+1}/{n_chunks}] Checkpoint found on disk ✓")
             continue
 
         start = ci * _EMBED_CHUNK_SIZE
         end   = min(start + _EMBED_CHUNK_SIZE, n)
-        chunk_texts = texts[start:end]
+
+        # Slice DataFrame only for this chunk — zero memory wasted for other chunks!
+        chunk_df = df.slice(start, end - start)
+        names = chunk_df["business_name"].fill_null("").to_list()
+        addrs = chunk_df["business_address"].fill_null("").to_list()
+        chunk_texts = [
+            build_text_for_embedding(nm, ad)
+            for nm, ad in zip(names, addrs)
+        ]
+        del chunk_df, names, addrs
 
         print(f"  [Chunk {ci+1}/{n_chunks}] Encoding rows {start:,}–{end:,} "
               f"({len(chunk_texts):,} texts) ...")
         chunk_emb = encode_texts(chunk_texts)   # float32, L2-normalised
+        del chunk_texts
+
         chunk_emb_f16 = chunk_emb.astype(np.float16)
         del chunk_emb
         gc.collect()
 
-        # Save as float16 immediately — ~380 MB, writes in < 5 sec
+        # Save as float16 immediately — ~366 MB, writes in < 5 sec
         np.save(chunk_path, chunk_emb_f16)
         chunk_mb = os.path.getsize(chunk_path) / (1024 ** 2)
         print(f"  [Chunk {ci+1}/{n_chunks}] Saved checkpoint: {chunk_mb:.0f} MB → {chunk_path}")
-        all_chunks.append(chunk_emb_f16)
+        del chunk_emb_f16
+        gc.collect()
 
-    del texts
+    # ── Merge all chunks via memory-mapped streaming into final file ──────
+    print(f"\nMerging {n_chunks} chunk(s) via memory-mapped streaming into final file ...")
+    final_mmap = np.lib.format.open_memmap(save_path, mode="w+", dtype=np.float16, shape=(n, dim))
+    for ci in range(n_chunks):
+        c_start = ci * _EMBED_CHUNK_SIZE
+        c_end   = min(c_start + _EMBED_CHUNK_SIZE, n)
+        c_path  = os.path.join(chunk_dir, f"chunk_{ci:04d}.npy")
+        c_arr   = np.load(c_path)
+        final_mmap[c_start:c_end] = c_arr
+        del c_arr
+    final_mmap.flush()
+    del final_mmap
     gc.collect()
 
-    # ── Merge all chunks into final file ──────────────────────────────────
-    print(f"\nMerging {n_chunks} chunk(s) into final embedding file ...")
-    embeds_f16 = np.vstack(all_chunks)
-    del all_chunks
-    gc.collect()
-
-    disk_mb = embeds_f16.nbytes / (1024 ** 2)
-    print(f"  Combined shape: {embeds_f16.shape}  ({disk_mb:.0f} MB float16)")
-    print(f"  Saving as float16 ({disk_mb:.0f} MB) → {save_path} ...")
-    np.save(save_path, embeds_f16)
-    print(f"  Saved {os.path.getsize(save_path) / 1024**2:.0f} MB  ✓")
+    disk_mb = os.path.getsize(save_path) / (1024 ** 2)
+    print(f"  Saved {disk_mb:.0f} MB float16 → {save_path}  ✓")
 
     # Clean up chunk directory now that full file is written
     shutil.rmtree(chunk_dir, ignore_errors=True)
     print("  Chunk checkpoints cleaned up.")
 
-    return embeds_f16.astype(np.float32)   # float32 for immediate in-memory use (FAISS)
+    return np.load(save_path, mmap_mode="r")
 
 
 # ─── Stage functions (called from notebook in sequence) ──────────────────────

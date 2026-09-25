@@ -202,8 +202,8 @@ def _ann_blocking_pairs(s1: pl.DataFrame,
         if not s1_mask or not s23_mask:
             continue
 
-        sub_s23_embeds = s23_embeds[s23_mask]
-        sub_s1_embeds  = s1_embeds[s1_mask]
+        sub_s23_embeds = np.ascontiguousarray(s23_embeds[s23_mask], dtype=np.float32)
+        sub_s1_embeds  = np.ascontiguousarray(s1_embeds[s1_mask], dtype=np.float32)
 
         # Build flat FAISS index (inner product on L2-normed = cosine)
         import faiss
@@ -247,10 +247,10 @@ def _cross_country_safety_net(s1: pl.DataFrame,
     dim = s23_embeds.shape[1]
     import faiss
     index = faiss.IndexFlatIP(dim)
-    index.add(s23_embeds)
+    index.add(np.ascontiguousarray(s23_embeds, dtype=np.float32))
 
     k = min(5, len(s23_ids))
-    distances, indices = index.search(s1_embeds, k)
+    distances, indices = index.search(np.ascontiguousarray(s1_embeds, dtype=np.float32), k)
 
     for qi, s1_id in enumerate(s1_ids):
         for rank in range(k):
