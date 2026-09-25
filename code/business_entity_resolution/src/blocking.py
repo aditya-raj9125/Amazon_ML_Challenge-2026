@@ -134,6 +134,9 @@ def _sorted_neighborhood_pairs(s1: pl.DataFrame,
     return pairs
 
 
+_MODEL_CACHE: dict = {}
+
+
 def encode_texts(texts: list[str],
                  model_name: str = EMBED_MODEL_NAME,
                  batch_size: int = EMBED_BATCH_SIZE,
@@ -144,12 +147,13 @@ def encode_texts(texts: list[str],
     Returns a float32 numpy array of shape (N, dim).
 
     Uses GPU if available, falls back to CPU.
-    The model is cached in memory after first load — call this function
-    once per source file, not once per pair.
+    The model is cached in memory across calls to avoid re-instantiation overhead.
     """
     from sentence_transformers import SentenceTransformer
 
-    model = SentenceTransformer(model_name)
+    if model_name not in _MODEL_CACHE:
+        _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
+    model = _MODEL_CACHE[model_name]
     model.max_seq_length = max_seq_len
 
     embeddings = model.encode(
@@ -158,8 +162,6 @@ def encode_texts(texts: list[str],
         show_progress_bar=True,
         convert_to_numpy=True,
         normalize_embeddings=True,   # L2-normalised → dot product == cosine
-        precision="float16",         # fp16: T4 Tensor Cores → ~1.8x throughput,
-                                     # zero quality loss for cosine similarity search
     )
     # Cast to float32 for FAISS compatibility (FAISS IndexFlatIP requires float32)
     return embeddings.astype(np.float32)

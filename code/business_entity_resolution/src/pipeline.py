@@ -25,6 +25,7 @@
 
 import os
 import sys
+import gc
 import math
 import shutil
 import pickle
@@ -233,7 +234,7 @@ def get_or_compute_embeddings(df: pl.DataFrame,
             print(f"  [Chunk {ci+1}/{n_chunks}] Loading from checkpoint ...")
             chunk_arr = np.load(chunk_path)
             all_chunks.append(
-                chunk_arr.astype(np.float32) if chunk_arr.dtype == np.float16 else chunk_arr
+                chunk_arr if chunk_arr.dtype == np.float16 else chunk_arr.astype(np.float16)
             )
             continue
 
@@ -244,20 +245,27 @@ def get_or_compute_embeddings(df: pl.DataFrame,
         print(f"  [Chunk {ci+1}/{n_chunks}] Encoding rows {start:,}–{end:,} "
               f"({len(chunk_texts):,} texts) ...")
         chunk_emb = encode_texts(chunk_texts)   # float32, L2-normalised
+        chunk_emb_f16 = chunk_emb.astype(np.float16)
+        del chunk_emb
+        gc.collect()
 
         # Save as float16 immediately — ~380 MB, writes in < 5 sec
-        np.save(chunk_path, chunk_emb.astype(np.float16))
+        np.save(chunk_path, chunk_emb_f16)
         chunk_mb = os.path.getsize(chunk_path) / (1024 ** 2)
         print(f"  [Chunk {ci+1}/{n_chunks}] Saved checkpoint: {chunk_mb:.0f} MB → {chunk_path}")
-        all_chunks.append(chunk_emb)
+        all_chunks.append(chunk_emb_f16)
+
+    del texts
+    gc.collect()
 
     # ── Merge all chunks into final file ──────────────────────────────────
     print(f"\nMerging {n_chunks} chunk(s) into final embedding file ...")
-    embeds = np.vstack(all_chunks)
-    print(f"  Combined shape: {embeds.shape}  ({embeds.nbytes / 1024**3:.2f} GB float32)")
+    embeds_f16 = np.vstack(all_chunks)
+    del all_chunks
+    gc.collect()
 
-    embeds_f16 = embeds.astype(np.float16)
     disk_mb = embeds_f16.nbytes / (1024 ** 2)
+    print(f"  Combined shape: {embeds_f16.shape}  ({disk_mb:.0f} MB float16)")
     print(f"  Saving as float16 ({disk_mb:.0f} MB) → {save_path} ...")
     np.save(save_path, embeds_f16)
     print(f"  Saved {os.path.getsize(save_path) / 1024**2:.0f} MB  ✓")
@@ -266,7 +274,7 @@ def get_or_compute_embeddings(df: pl.DataFrame,
     shutil.rmtree(chunk_dir, ignore_errors=True)
     print("  Chunk checkpoints cleaned up.")
 
-    return embeds   # float32 for immediate in-memory use
+    return embeds_f16.astype(np.float32)   # float32 for immediate in-memory use (FAISS)
 
 
 # ─── Stage functions (called from notebook in sequence) ──────────────────────
