@@ -6,14 +6,26 @@
 
 import os
 
-# ─── Data Paths (Colab / Drive layout) ───────────────────────────────────────
-# Set DATA_ROOT to wherever you mounted the dataset.
-# Example for Colab + Google Drive:
-#   DATA_ROOT = "/content/drive/MyDrive/Amazon_ML_Challenge_2026/Datasets/student_resource/dataset"
-DATA_ROOT = os.environ.get(
-    "AMAZON_ML_DATA",
-    "/content/drive/MyDrive/Amazon_ML_Challenge_2026/Datasets/student_resource/dataset",
-)
+# ─── Data Paths (Auto-detects Local / SageMaker vs Colab Drive) ───────────────
+def _find_data_root() -> str:
+    if "AMAZON_ML_DATA" in os.environ and os.path.exists(os.environ["AMAZON_ML_DATA"]):
+        return os.environ["AMAZON_ML_DATA"]
+
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    candidate_paths = [
+        os.path.join(repo_root, "dataset"),
+        os.path.join(repo_root, "dataset", "student_resource", "dataset"),
+        os.path.join(repo_root, "dataset", "student_resource"),
+        os.path.join(repo_root, "Datasets", "student_resource", "dataset"),
+        os.path.join(repo_root, "dataset", "dataset"),
+        "/content/drive/MyDrive/Amazon_ML_Challenge_2026/Datasets/student_resource/dataset",
+    ]
+    for p in candidate_paths:
+        if os.path.exists(os.path.join(p, "train")):
+            return p
+    return candidate_paths[0]
+
+DATA_ROOT = _find_data_root()
 
 TRAIN_DIR = os.path.join(DATA_ROOT, "train")
 TEST_DIR  = os.path.join(DATA_ROOT, "test")
