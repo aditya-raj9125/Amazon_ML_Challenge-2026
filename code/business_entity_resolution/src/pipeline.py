@@ -202,8 +202,13 @@ def get_or_compute_embeddings(df: pl.DataFrame,
     ]
     print(f"Encoding {len(texts):,} texts with {EMBED_MODEL_NAME} ...")
     embeds = encode_texts(texts)
+    size_gb = embeds.nbytes / (1024 ** 3)
+    print(f"\nEncoding done! shape={embeds.shape}  size={size_gb:.2f} GB")
+    print(f"Saving to disk: {save_path}")
+    print("  (Writing a large file — this may take 2-5 min with no progress bar. DO NOT interrupt.) ...")
     np.save(save_path, embeds)
-    print(f"Embeddings saved to {save_path}  shape={embeds.shape}")
+    saved_mb = os.path.getsize(save_path) / (1024 ** 2)
+    print(f"  Saved {saved_mb:.0f} MB  →  {save_path}")
     return embeds
 
 
