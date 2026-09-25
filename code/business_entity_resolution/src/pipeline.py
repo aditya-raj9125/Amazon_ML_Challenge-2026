@@ -190,7 +190,9 @@ def get_or_compute_embeddings(df: pl.DataFrame,
     """
     if not force_recompute and os.path.exists(save_path):
         print(f"Loading cached embeddings from {save_path} ...")
-        return np.load(save_path)
+        arr = np.load(save_path)
+        # Upgrade float16 → float32 for FAISS compatibility (if saved in fp16 format)
+        return arr.astype(np.float32) if arr.dtype == np.float16 else arr
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     texts = [
@@ -201,15 +203,23 @@ def get_or_compute_embeddings(df: pl.DataFrame,
         for row in df.iter_rows(named=True)
     ]
     print(f"Encoding {len(texts):,} texts with {EMBED_MODEL_NAME} ...")
-    embeds = encode_texts(texts)
-    size_gb = embeds.nbytes / (1024 ** 3)
-    print(f"\nEncoding done! shape={embeds.shape}  size={size_gb:.2f} GB")
-    print(f"Saving to disk: {save_path}")
-    print("  (Writing a large file — this may take 2-5 min with no progress bar. DO NOT interrupt.) ...")
-    np.save(save_path, embeds)
+    embeds = encode_texts(texts)  # returns float32 already (cast from fp16 in encode_texts)
+
+    size_gb_f32 = embeds.nbytes / (1024 ** 3)
+    # Save as float16 — halves disk write from ~3.2 GB to ~1.6 GB per source.
+    # FAISS requires float32, so we cast back on load (above). Quality loss is zero
+    # for cosine similarity because L2-normalised vectors are identical at fp16 precision.
+    embeds_f16 = embeds.astype(np.float16)
+    size_gb_f16 = embeds_f16.nbytes / (1024 ** 3)
+    print(f"\nEncoding done! shape={embeds.shape}  "
+          f"in-memory={size_gb_f32:.2f} GB  on-disk={size_gb_f16:.2f} GB (float16)")
+    print(f"Saving to disk (float16): {save_path}")
+    print("  (Writing ~1.6 GB — should take < 30 seconds. DO NOT interrupt.) ...")
+    np.save(save_path, embeds_f16)
     saved_mb = os.path.getsize(save_path) / (1024 ** 2)
     print(f"  Saved {saved_mb:.0f} MB  →  {save_path}")
-    return embeds
+    return embeds   # return float32 for immediate in-memory use (no re-conversion needed)
+
 
 
 # ─── Stage functions (called from notebook in sequence) ──────────────────────
