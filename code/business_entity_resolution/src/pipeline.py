@@ -25,6 +25,8 @@
 
 import os
 import sys
+import math
+import shutil
 import pickle
 
 import numpy as np
@@ -176,25 +178,37 @@ def gt_to_dict(gt_df: pl.DataFrame) -> dict[str, set[str]]:
 
 # ─── Embedding helpers ────────────────────────────────────────────────────────
 
+# How many texts to encode per chunk before saving to disk.
+# 500K × 384 × fp16 = ~384 MB per chunk file — saves in ~3 sec on EBS.
+# If the kernel dies, only the in-progress chunk is lost; completed chunks survive.
+_EMBED_CHUNK_SIZE = 500_000
+
+
 def get_or_compute_embeddings(df: pl.DataFrame,
                                save_path: str,
                                force_recompute: bool = False) -> np.ndarray:
     """
-    Load pre-computed embeddings from disk or compute and cache them.
+    Load pre-computed embeddings from disk, or encode + cache with checkpointing.
 
-    Embeddings are the most expensive step (~1-2 hrs on T4 for 5M rows).
-    Caching ensures you don't redo this if you restart the notebook.
+    CHECKPOINT BEHAVIOUR
+    ────────────────────
+    Encodes `_EMBED_CHUNK_SIZE` rows at a time and saves each chunk immediately
+    as a float16 .npy file in <save_path>.chunks/.  If the kernel is killed
+    mid-run, completed chunks survive on disk.  On the next call, those chunks
+    are loaded from cache and only missing chunks are re-encoded.
 
-    The text fed to the encoder is: raw business_name + " " + raw business_address
-    (un-normalised, so the multilingual model can use its full vocabulary).
+    Once all chunks are done, they are merged into the final `save_path` file
+    and the chunk directory is deleted.
     """
+    # ── Full cache hit ────────────────────────────────────────────────────
     if not force_recompute and os.path.exists(save_path):
         print(f"Loading cached embeddings from {save_path} ...")
         arr = np.load(save_path)
-        # Upgrade float16 → float32 for FAISS compatibility (if saved in fp16 format)
         return arr.astype(np.float32) if arr.dtype == np.float16 else arr
 
+    # ── Build text list ───────────────────────────────────────────────────
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    print(f"Building text list for {len(df):,} records ...")
     texts = [
         build_text_for_embedding(
             row.get("business_name", "") or "",
@@ -202,24 +216,57 @@ def get_or_compute_embeddings(df: pl.DataFrame,
         )
         for row in df.iter_rows(named=True)
     ]
-    print(f"Encoding {len(texts):,} texts with {EMBED_MODEL_NAME} ...")
-    embeds = encode_texts(texts)  # returns float32 already (cast from fp16 in encode_texts)
+    n = len(texts)
+    n_chunks = math.ceil(n / _EMBED_CHUNK_SIZE)
+    chunk_dir = save_path + ".chunks"
+    os.makedirs(chunk_dir, exist_ok=True)
 
-    size_gb_f32 = embeds.nbytes / (1024 ** 3)
-    # Save as float16 — halves disk write from ~3.2 GB to ~1.6 GB per source.
-    # FAISS requires float32, so we cast back on load (above). Quality loss is zero
-    # for cosine similarity because L2-normalised vectors are identical at fp16 precision.
+    print(f"Encoding {n:,} texts in {n_chunks} chunk(s) of {_EMBED_CHUNK_SIZE:,} "
+          f"(checkpoint after every chunk) ...")
+
+    # ── Encode / load chunk by chunk ──────────────────────────────────────
+    all_chunks = []
+    for ci in range(n_chunks):
+        chunk_path = os.path.join(chunk_dir, f"chunk_{ci:04d}.npy")
+
+        if not force_recompute and os.path.exists(chunk_path):
+            print(f"  [Chunk {ci+1}/{n_chunks}] Loading from checkpoint ...")
+            chunk_arr = np.load(chunk_path)
+            all_chunks.append(
+                chunk_arr.astype(np.float32) if chunk_arr.dtype == np.float16 else chunk_arr
+            )
+            continue
+
+        start = ci * _EMBED_CHUNK_SIZE
+        end   = min(start + _EMBED_CHUNK_SIZE, n)
+        chunk_texts = texts[start:end]
+
+        print(f"  [Chunk {ci+1}/{n_chunks}] Encoding rows {start:,}–{end:,} "
+              f"({len(chunk_texts):,} texts) ...")
+        chunk_emb = encode_texts(chunk_texts)   # float32, L2-normalised
+
+        # Save as float16 immediately — ~380 MB, writes in < 5 sec
+        np.save(chunk_path, chunk_emb.astype(np.float16))
+        chunk_mb = os.path.getsize(chunk_path) / (1024 ** 2)
+        print(f"  [Chunk {ci+1}/{n_chunks}] Saved checkpoint: {chunk_mb:.0f} MB → {chunk_path}")
+        all_chunks.append(chunk_emb)
+
+    # ── Merge all chunks into final file ──────────────────────────────────
+    print(f"\nMerging {n_chunks} chunk(s) into final embedding file ...")
+    embeds = np.vstack(all_chunks)
+    print(f"  Combined shape: {embeds.shape}  ({embeds.nbytes / 1024**3:.2f} GB float32)")
+
     embeds_f16 = embeds.astype(np.float16)
-    size_gb_f16 = embeds_f16.nbytes / (1024 ** 3)
-    print(f"\nEncoding done! shape={embeds.shape}  "
-          f"in-memory={size_gb_f32:.2f} GB  on-disk={size_gb_f16:.2f} GB (float16)")
-    print(f"Saving to disk (float16): {save_path}")
-    print("  (Writing ~1.6 GB — should take < 30 seconds. DO NOT interrupt.) ...")
+    disk_mb = embeds_f16.nbytes / (1024 ** 2)
+    print(f"  Saving as float16 ({disk_mb:.0f} MB) → {save_path} ...")
     np.save(save_path, embeds_f16)
-    saved_mb = os.path.getsize(save_path) / (1024 ** 2)
-    print(f"  Saved {saved_mb:.0f} MB  →  {save_path}")
-    return embeds   # return float32 for immediate in-memory use (no re-conversion needed)
+    print(f"  Saved {os.path.getsize(save_path) / 1024**2:.0f} MB  ✓")
 
+    # Clean up chunk directory now that full file is written
+    shutil.rmtree(chunk_dir, ignore_errors=True)
+    print("  Chunk checkpoints cleaned up.")
+
+    return embeds   # float32 for immediate in-memory use
 
 
 # ─── Stage functions (called from notebook in sequence) ──────────────────────
