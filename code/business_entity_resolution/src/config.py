@@ -8,20 +8,35 @@ import os
 
 # ─── Data Paths (Auto-detects Local / SageMaker vs Colab Drive) ───────────────
 def _find_data_root() -> str:
-    if "AMAZON_ML_DATA" in os.environ and os.path.exists(os.environ["AMAZON_ML_DATA"]):
-        return os.environ["AMAZON_ML_DATA"]
+    # 1. Check environment variable override
+    if "AMAZON_ML_DATA" in os.environ:
+        env_path = os.environ["AMAZON_ML_DATA"]
+        if os.path.exists(os.path.join(env_path, "train", "train_source1.tsv")):
+            return env_path
+        if os.path.basename(env_path) == "train" and os.path.exists(os.path.join(env_path, "train_source1.tsv")):
+            return os.path.dirname(env_path)
 
     repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+    # 2. Search for the actual train_source1.tsv file inside the repository
+    for root, dirs, files in os.walk(repo_root):
+        # Skip hidden cache directories like .cache
+        dirs[:] = [d for d in dirs if not d.startswith(".")]
+        if "train_source1.tsv" in files:
+            if os.path.basename(root) == "train":
+                return os.path.dirname(root)
+            return root
+
+    # 3. Fallbacks
     candidate_paths = [
         os.path.join(repo_root, "dataset"),
         os.path.join(repo_root, "dataset", "student_resource", "dataset"),
         os.path.join(repo_root, "dataset", "student_resource"),
-        os.path.join(repo_root, "Datasets", "student_resource", "dataset"),
         os.path.join(repo_root, "dataset", "dataset"),
         "/content/drive/MyDrive/Amazon_ML_Challenge_2026/Datasets/student_resource/dataset",
     ]
     for p in candidate_paths:
-        if os.path.exists(os.path.join(p, "train")):
+        if os.path.exists(os.path.join(p, "train", "train_source1.tsv")):
             return p
     return candidate_paths[0]
 
