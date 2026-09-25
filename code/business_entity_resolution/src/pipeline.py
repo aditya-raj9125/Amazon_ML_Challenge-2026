@@ -89,6 +89,15 @@ def load_source(path: str) -> pl.DataFrame:
         print(f"  Rows: {len(df):,}")
         return df
 
+    if not os.path.exists(path):
+        from config import DATA_ROOT, REPO_ROOT
+        raise FileNotFoundError(
+            f"\n[ERROR] Source file not found: {path}\n"
+            f"  - Configured DATA_ROOT : {DATA_ROOT}\n"
+            f"  - REPO_ROOT           : {REPO_ROOT}\n"
+            f"Please ensure your dataset files are inside '{os.path.join(REPO_ROOT, 'dataset')}' or set AMAZON_ML_DATA."
+        )
+
     print(f"Loading {os.path.basename(path)} (TSV) ...")
     df = pl.read_csv(
         path,
@@ -125,6 +134,14 @@ def load_ground_truth(path: str) -> pl.DataFrame:
         df = pl.read_parquet(parquet_path)
         print(f"  GT rows: {len(df):,}")
         return df
+
+    if not os.path.exists(path):
+        from config import DATA_ROOT, REPO_ROOT
+        raise FileNotFoundError(
+            f"\n[ERROR] Ground truth file not found: {path}\n"
+            f"  - Configured DATA_ROOT : {DATA_ROOT}\n"
+            f"  - REPO_ROOT           : {REPO_ROOT}\n"
+        )
 
     print(f"Loading ground truth (TSV) ...")
     df = pl.read_csv(
