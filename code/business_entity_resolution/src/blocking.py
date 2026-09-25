@@ -243,6 +243,7 @@ def _cross_country_safety_net(s1: pl.DataFrame,
     s23_countries = dict(zip(s23_ids, s23["country"].to_list()))
 
     dim = s23_embeds.shape[1]
+    import faiss
     index = faiss.IndexFlatIP(dim)
     index.add(s23_embeds)
 
