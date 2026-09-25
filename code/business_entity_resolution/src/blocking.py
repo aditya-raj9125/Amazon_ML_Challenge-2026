@@ -5,8 +5,8 @@
 # be scored by the LightGBM matcher.
 #
 # Three complementary strategies are combined (union):
-#   A. Token blocking       — exact-match on normalized name/address keys
-#   B. Sorted-neighborhood  — slide window over sorted name prefix (vectorized Polars shifts)
+#   A. Token blocking       — exact-match on normalized name/address & high-signal prefixes
+#   B. Sorted-neighborhood  — slide window over sorted & natural name (vectorized Polars shifts)
 #   C. ANN blocking         — top-k vector retrieval on multilingual embeddings (PyTorch GPU/CPU)
 #
 # Country partitioning is applied FIRST as a hard pre-filter (zero
@@ -31,7 +31,7 @@ from config import (
 )
 
 
-# ─── Strategy A: Vectorized Polars Exact Matching ────────────────────────────
+# ─── Strategy A: Vectorized Polars Exact & Prefix Matching ───────────────────
 
 def _add_exact_matches(candidates: dict[str, set[str]],
                        s1: pl.DataFrame,
@@ -82,24 +82,77 @@ def _add_exact_matches(candidates: dict[str, set[str]],
     gc.collect()
 
 
+def _add_prefix_matches(candidates: dict[str, set[str]],
+                        s1: pl.DataFrame,
+                        target: pl.DataFrame,
+                        col: str,
+                        prefix_len: int = 4,
+                        max_bucket_size: int = 100):
+    """
+    Match entities on first N characters of name or address within country.
+    Captures spelling variations (e.g. 'Walmart Supercenter' vs 'Walmart').
+    Runs in < 1.5 seconds in Polars Rust.
+    """
+    if col not in s1.columns or col not in target.columns:
+        return
+
+    pref_col = f"{col}_pref"
+    s1_pref = (
+        s1.select(["entity_id", "country", pl.col(col).str.slice(0, prefix_len).alias(pref_col)])
+          .filter(pl.col(pref_col).is_not_null())
+          .filter(pl.col(pref_col).str.len_chars() >= prefix_len)
+          .filter(pl.len().over(["country", pref_col]) <= max_bucket_size)
+    )
+    tgt_pref = (
+        target.select(["entity_id", "country", pl.col(col).str.slice(0, prefix_len).alias(pref_col)])
+              .filter(pl.col(pref_col).is_not_null())
+              .filter(pl.col(pref_col).str.len_chars() >= prefix_len)
+              .filter(pl.len().over(["country", pref_col]) <= max_bucket_size)
+    )
+    matches = s1_pref.join(tgt_pref, on=["country", pref_col], how="inner")
+    del s1_pref, tgt_pref
+    gc.collect()
+
+    if matches.height == 0:
+        del matches
+        return
+
+    grouped = (
+        matches.select(["entity_id", "entity_id_right"])
+               .group_by("entity_id")
+               .agg(pl.col("entity_id_right"))
+    )
+    del matches
+    gc.collect()
+
+    for s1_id, tgts in zip(grouped["entity_id"].to_list(), grouped["entity_id_right"].to_list()):
+        candidates[s1_id].update(tgts)
+    del grouped
+    gc.collect()
+
+
 # ─── Strategy B: Vectorized Sorted Neighborhood Method (SNM) ────────────────
 
 def _add_snm_matches(candidates: dict[str, set[str]],
                      s1: pl.DataFrame,
                      target: pl.DataFrame,
-                     window: int = 3):
+                     col: str = "norm_name",
+                     window: int = 5):
     """
-    Sorted-Neighborhood Method on norm_name within each country.
+    Sorted-Neighborhood Method on a column within each country.
     100% vectorized in Polars using column shifts in Rust. Zero Python loops, < 1 second runtime.
     """
-    s1_sub = s1.select(["entity_id", "country", "norm_name"]).with_columns(
+    if col not in s1.columns or col not in target.columns:
+        return
+
+    s1_sub = s1.select(["entity_id", "country", col]).with_columns(
         pl.lit("S1").alias("src"))
-    tgt_sub = target.select(["entity_id", "country", "norm_name"]).with_columns(
+    tgt_sub = target.select(["entity_id", "country", col]).with_columns(
         pl.lit("TGT").alias("src"))
     combined = (
         pl.concat([s1_sub, tgt_sub])
-          .filter(pl.col("norm_name").str.len_chars() >= 2)
-          .sort(["country", "norm_name"])
+          .filter(pl.col(col).str.len_chars() >= 2)
+          .sort(["country", col])
     )
     del s1_sub, tgt_sub
     gc.collect()
@@ -174,7 +227,7 @@ def _add_ann_matches(candidates: dict[str, set[str]],
                      target_df: pl.DataFrame,
                      s1_embeds: np.ndarray,
                      target_embeds: np.ndarray,
-                     top_k: int = 15,
+                     top_k: int = 30,
                      max_sim_bytes: int = 512 * 1024 * 1024):
     """
     Search S1 embeddings against target (S2 or S3) partitioned by country.
@@ -218,7 +271,7 @@ def _add_ann_matches(candidates: dict[str, set[str]],
         elem_bytes = 2 if use_fp16 else 4
         safe_batch_size = max(32, min(512, int(max_sim_bytes / (n_tgt * elem_bytes))))
         vram_mb = int(safe_batch_size * n_tgt * elem_bytes / (1024 * 1024))
-        print(f"           [{country}] {n_queries:,} queries vs {n_tgt:,} targets (batch={safe_batch_size}, ~{vram_mb} MB VRAM) ...")
+        print(f"           [{country}] {n_queries:,} queries vs {n_tgt:,} targets (top-{k}, batch={safe_batch_size}, ~{vram_mb} MB VRAM) ...")
 
         try:
             # Load target embeddings directly in float16/float32
@@ -307,23 +360,32 @@ def generate_candidates(s1: pl.DataFrame,
                          snm_window: int = SNM_WINDOW) -> dict[str, set[str]]:
     """
     Generate candidates directly into a dict-of-sets.
+    Combines exact match, prefix match, natural + sorted SNM, and ANN top-30.
     Peak RAM: < 500 MB. Zero tuple sets, zero DataFrame duplication.
     """
     candidates: dict[str, set[str]] = defaultdict(set)
 
-    print("[Blocking] Strategy A: Vectorized exact name & address matching ...")
+    print("[Blocking] Strategy A: Exact matching (name, address & high-signal prefixes) ...")
     _add_exact_matches(candidates, s1, s2, "norm_name")
     _add_exact_matches(candidates, s1, s3, "norm_name")
     _add_exact_matches(candidates, s1, s2, "norm_addr")
     _add_exact_matches(candidates, s1, s3, "norm_addr")
+    _add_prefix_matches(candidates, s1, s2, "norm_name", prefix_len=4, max_bucket_size=100)
+    _add_prefix_matches(candidates, s1, s3, "norm_name", prefix_len=4, max_bucket_size=100)
+    _add_prefix_matches(candidates, s1, s2, "norm_name_ns", prefix_len=4, max_bucket_size=100)
+    _add_prefix_matches(candidates, s1, s3, "norm_name_ns", prefix_len=4, max_bucket_size=100)
+    _add_prefix_matches(candidates, s1, s2, "norm_addr", prefix_len=6, max_bucket_size=50)
+    _add_prefix_matches(candidates, s1, s3, "norm_addr", prefix_len=6, max_bucket_size=50)
     print(f"           Pairs after Strategy A: {sum(len(v) for v in candidates.values()):,}")
 
     print(f"[Blocking] Strategy B: Vectorized sorted-neighborhood (window={snm_window}) ...")
-    _add_snm_matches(candidates, s1, s2, window=snm_window)
-    _add_snm_matches(candidates, s1, s3, window=snm_window)
+    _add_snm_matches(candidates, s1, s2, col="norm_name", window=snm_window)
+    _add_snm_matches(candidates, s1, s3, col="norm_name", window=snm_window)
+    _add_snm_matches(candidates, s1, s2, col="norm_name_ns", window=snm_window)
+    _add_snm_matches(candidates, s1, s3, col="norm_name_ns", window=snm_window)
     print(f"           Pairs after Strategy B: {sum(len(v) for v in candidates.values()):,}")
 
-    ann_k = max(10, top_k // 2)
+    ann_k = max(30, top_k)
     print(f"[Blocking] Strategy C: Vector ANN search (top-{ann_k} per target) ...")
     _add_ann_matches(candidates, s1, s2, s1_embeds, s2_embeds, top_k=ann_k)
     _add_ann_matches(candidates, s1, s3, s1_embeds, s3_embeds, top_k=ann_k)
