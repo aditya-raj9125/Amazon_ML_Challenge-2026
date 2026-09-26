@@ -14,6 +14,10 @@
 # Cell 2 also sets the environment variable AMAZON_ML_DATA to point to that
 # directory so config.py finds it immediately — no filesystem walking needed.
 # ─────────────────────────────────────────────────────────────────────────────
+# SAGEMAKER INSTANCE: ml.g6e.2xlarge (64 GB RAM, 75 GB EBS)
+# → Budget: 64 GB RAM, 65 GB EBS (leaving 10 GB legroom)
+# → GPU: 1× NVIDIA L40s (48 GB VRAM) — excellent for embeddings + ANN
+# ─────────────────────────────────────────────────────────────────────────────
 
 import os
 
@@ -23,11 +27,6 @@ import os
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
 # ─── Data Root ───────────────────────────────────────────────────────────────
-# Candidates checked in priority order (first valid one wins):
-#   1. AMAZON_ML_DATA env var — set explicitly by notebook Cell 2 (preferred)
-#   2. <REPO_ROOT>/dataset    — standard local checkout layout
-#   3. SageMaker default      — fallback if env var was not set
-
 def _is_valid_data_root(path: str) -> bool:
     """True if the directory actually contains training TSV files."""
     if not path or not os.path.exists(path):
@@ -105,9 +104,11 @@ EMBED_S1_TEST_PATH  = os.path.join(ARTIFACTS_DIR, "embed_s1_test.npy")
 EMBED_S2_TEST_PATH  = os.path.join(ARTIFACTS_DIR, "embed_s2_test.npy")
 EMBED_S3_TEST_PATH  = os.path.join(ARTIFACTS_DIR, "embed_s3_test.npy")
 
+# ─── Checkpoint Cache ─────────────────────────────────────────────────────────
+# For resuming after kernel crashes. Saved as parquet/pickle.
+CHECKPOINT_DIR = os.path.join(os.path.dirname(__file__), "..", "checkpoints")
+
 # ─── Parquet Cache ────────────────────────────────────────────────────────────
-# TSV → zstd Parquet on first load; subsequent loads skip TSV (~10x faster).
-# None = cache next to original TSV.  Set to an explicit path if preferred.
 PARQUET_CACHE_DIR = None
 
 # ─── Train / Validation Split ─────────────────────────────────────────────────
@@ -115,8 +116,14 @@ VAL_FRACTION = 0.20
 RANDOM_SEED  = 42
 
 # ─── Blocking Parameters ──────────────────────────────────────────────────────
-ANN_TOP_K  = 30   # FAISS top-k neighbours per S1 entity
-SNM_WINDOW = 5    # sorted-neighborhood sliding window width
+ANN_TOP_K  = 30   # ANN top-k neighbours per S1 entity per source
+SNM_WINDOW = 5    # sorted-neighborhood sliding window width (used in fallback)
+
+# TF-IDF blocking parameters (from teammate's best config)
+TFIDF_COMB_K = 50    # combined name+addr word TF-IDF top-K
+TFIDF_ADDR_K = 25    # address-only TF-IDF top-K
+TFIDF_CHAR_K = 12    # char 4-gram no-space name TF-IDF top-K
+TFIDF_REV_K  = 5     # reverse (pool→S1) top-K
 
 # Cross-country safety-net (insurance against France mislabelling)
 CROSS_COUNTRY_NAME_THRESH = 0.95
@@ -126,7 +133,7 @@ CROSS_COUNTRY_ADDR_THRESH = 0.90
 # MIT-licensed, multilingual (Hindi-transliteration + French zero-shot).
 # 117M params — well under 8B cap. 384-dim output.
 EMBED_MODEL_NAME  = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-EMBED_BATCH_SIZE  = 512    # fits 16 GB VRAM at fp16
+EMBED_BATCH_SIZE  = 1024   # ml.g6e.2xlarge has 48 GB VRAM — can handle larger batches
 EMBED_MAX_SEQ_LEN = 128
 
 # ─── TF-IDF ───────────────────────────────────────────────────────────────────
@@ -135,35 +142,40 @@ TFIDF_NGRAM_RANGE  = (2, 4)
 TFIDF_MAX_FEATURES = 200_000
 
 # ─── LightGBM Hyper-parameters ────────────────────────────────────────────────
+# Tuned for high precision (F0.5 is precision-heavy):
+# - 255 leaves (more capacity to learn complex distractor patterns)
+# - 1500 rounds with early stopping
+# - scale_pos_weight < 1 for precision bias
 LGBM_PARAMS = {
     "objective":         "binary",
     "metric":            "binary_logloss",
     "boosting_type":     "gbdt",
-    "num_leaves":        127,
+    "num_leaves":        255,           # increased from 127 for more capacity
     "max_depth":         -1,
     "learning_rate":     0.05,
-    "n_estimators":      1000,
+    "n_estimators":      1500,          # increased from 1000
     "min_child_samples": 50,
     "subsample":         0.8,
     "colsample_bytree":  0.8,
     "reg_alpha":         0.1,
     "reg_lambda":        1.0,
-    # F0.5 is precision-heavy; lower scale_pos_weight → more precision.
+    # F0.5 is precision-heavy; scale_pos_weight < 1 → more precision.
     "scale_pos_weight":  0.5,
     "n_jobs":            -1,
     "random_state":      RANDOM_SEED,
     "verbose":           -1,
 }
 
-LGBM_EARLY_STOPPING_ROUNDS = 50
+LGBM_EARLY_STOPPING_ROUNDS = 100    # increased from 50 for more patience
 
 # ─── Negative Sampling ────────────────────────────────────────────────────────
-NEG_TO_POS_RATIO = 8   # hard negatives : positives ratio in training
+# Higher ratio = more hard negatives = better distractor discrimination
+NEG_TO_POS_RATIO = 10   # increased from 8
 
 # ─── Threshold Sweep ─────────────────────────────────────────────────────────
 THRESHOLD_LOW  = 0.30
 THRESHOLD_HIGH = 0.95
-THRESHOLD_STEP = 0.01
+THRESHOLD_STEP = 0.005   # finer resolution (was 0.01)
 
 # ─── Post-processing ──────────────────────────────────────────────────────────
 ENABLE_ONE_TO_ONE_DEDUP    = True
