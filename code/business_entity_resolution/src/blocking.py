@@ -272,40 +272,104 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
             matched_cands = []
 
             try:
-                sub_tgt = tgt_embeds[tgt_idx_arr]
-                if use_fp16:
-                    tgt_t = torch.from_numpy(sub_tgt.astype(np.float16)).to(device)
-                else:
-                    tgt_t = torch.from_numpy(sub_tgt.astype(np.float32)).to(device)
-                del sub_tgt
-
-                tgt_t_T = tgt_t.t().contiguous()
-                del tgt_t
-
+                # Load all S1 embeddings for this country into CPU RAM
                 country_s1_embs = s1_embeds[s1_idx_arr]
                 if use_fp16:
                     country_s1_embs = country_s1_embs.astype(np.float16)
                 else:
                     country_s1_embs = country_s1_embs.astype(np.float32)
 
-                for b_start in range(0, n_queries, query_batch_size):
-                    b_end = min(b_start + query_batch_size, n_queries)
-                    b_embs = country_s1_embs[b_start:b_end]
+                # Chunk target to avoid OOM:
+                # sim matrix = (q_batch, tgt_chunk) × 2 bytes must fit in ~8 GB
+                # tgt_chunk = 500K, q_batch auto-sized
+                TGT_CHUNK = 500_000
+                n_tgt_chunks = (n_tgt + TGT_CHUNK - 1) // TGT_CHUNK
 
-                    q_t = torch.from_numpy(b_embs).to(device)
-                    sim = torch.mm(q_t, tgt_t_T)
-                    _, topk_local_idx = torch.topk(sim, k=k, dim=1)
-                    topk_np = topk_local_idx.cpu().numpy()
-                    del sim, q_t, topk_local_idx
+                # Auto-size query batch: q_batch × tgt_chunk_actual × 2 < 6 GB
+                max_tgt_chunk = min(TGT_CHUNK, n_tgt)
+                q_batch = min(query_batch_size, max(512, int(6e9 / (max_tgt_chunk * 2))))
 
-                    for qi in range(b_end - b_start):
-                        s1_id = country_s1_ids[b_start + qi]
+                print(f"    [{country}] {n_queries:,} queries × {n_tgt:,} targets "
+                      f"(tgt_chunks={n_tgt_chunks}, q_batch={q_batch})", flush=True)
+
+                # For each query batch, iterate over target chunks and merge top-k
+                for qb_start in range(0, n_queries, q_batch):
+                    qb_end = min(qb_start + q_batch, n_queries)
+                    q_embs = country_s1_embs[qb_start:qb_end]
+                    q_t = torch.from_numpy(q_embs).to(device)
+                    n_q = qb_end - qb_start
+
+                    # Accumulate top-k scores and indices across target chunks
+                    all_scores = torch.full((n_q, k), -1.0, device=device,
+                                           dtype=torch.float16 if use_fp16 else torch.float32)
+                    all_indices = torch.full((n_q, k), -1, device=device, dtype=torch.long)
+
+                    for tc in range(n_tgt_chunks):
+                        tc_start = tc * TGT_CHUNK
+                        tc_end = min(tc_start + TGT_CHUNK, n_tgt)
+                        tc_size = tc_end - tc_start
+
+                        # Load target chunk to GPU
+                        sub_tgt = tgt_embeds[tgt_idx_arr[tc_start:tc_end]]
+                        if use_fp16:
+                            tgt_chunk_t = torch.from_numpy(sub_tgt.astype(np.float16)).to(device)
+                        else:
+                            tgt_chunk_t = torch.from_numpy(sub_tgt.astype(np.float32)).to(device)
+                        del sub_tgt
+
+                        # Compute similarity for this chunk
+                        sim_chunk = torch.mm(q_t, tgt_chunk_t.t())
+                        del tgt_chunk_t
+
+                        chunk_k = min(k, tc_size)
+                        chunk_scores, chunk_local_idx = torch.topk(sim_chunk, k=chunk_k, dim=1)
+                        del sim_chunk
+
+                        # Offset local indices to global target indices
+                        chunk_global_idx = chunk_local_idx + tc_start
+                        del chunk_local_idx
+
+                        # Merge with accumulated top-k
+                        # Pad chunk results if chunk_k < k
+                        if chunk_k < k:
+                            pad_s = torch.full((n_q, k - chunk_k), -1.0, device=device,
+                                               dtype=chunk_scores.dtype)
+                            pad_i = torch.full((n_q, k - chunk_k), -1, device=device,
+                                               dtype=torch.long)
+                            chunk_scores = torch.cat([chunk_scores, pad_s], dim=1)
+                            chunk_global_idx = torch.cat([chunk_global_idx, pad_i], dim=1)
+                            del pad_s, pad_i
+
+                        combined_scores = torch.cat([all_scores, chunk_scores], dim=1)
+                        combined_indices = torch.cat([all_indices, chunk_global_idx], dim=1)
+                        del chunk_scores, chunk_global_idx
+
+                        top_scores, merge_idx = torch.topk(combined_scores, k=k, dim=1)
+                        all_scores = top_scores
+                        all_indices = combined_indices.gather(1, merge_idx)
+                        del combined_scores, combined_indices, top_scores, merge_idx
+
+                        if device.type == "cuda":
+                            torch.cuda.empty_cache()
+
+                    del q_t
+
+                    # Extract results
+                    topk_np = all_indices.cpu().numpy()
+                    del all_scores, all_indices
+
+                    for qi in range(n_q):
+                        s1_id = country_s1_ids[qb_start + qi]
                         for loc in topk_np[qi]:
                             if loc >= 0:
                                 matched_s1.append(s1_id)
                                 matched_cands.append(country_tgt_ids[loc])
 
-                del country_s1_embs, tgt_t_T
+                    del topk_np
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+                del country_s1_embs
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
 
