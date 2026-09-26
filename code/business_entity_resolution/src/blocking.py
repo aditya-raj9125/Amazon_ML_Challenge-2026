@@ -18,9 +18,11 @@
 # MEMORY BUDGET: < 5 GB peak on 32 GB SageMaker ml.g5.2xlarge
 # ==============================================================================
 
+import os
 import gc
 import sys
 import time
+import pickle
 import traceback
 from collections import defaultdict
 
@@ -29,13 +31,38 @@ import polars as pl
 from tqdm import tqdm
 
 from config import (
-    ANN_TOP_K,
+    ANN_TOP_K, CHECKPOINT_DIR,
     EMBED_MODEL_NAME, EMBED_BATCH_SIZE, EMBED_MAX_SEQ_LEN,
     HF_CACHE_DIR,
 )
 
 # Maximum candidates permitted per S1 entity (prevents outlier bloat)
 MAX_CANDS_PER_S1 = 100
+
+
+def _save_pickle(obj, path: str):
+    """Atomic write to prevent corrupted checkpoint if killed mid-write."""
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    os.rename(tmp_path, path)
+    size_mb = os.path.getsize(path) / (1024 * 1024)
+    print(f"  [Checkpoint Saved] {size_mb:.1f} MB → {path}")
+
+
+def _load_pickle(path: str):
+    """Load candidates dictionary from checkpoint file."""
+    print(f"  [Checkpoint Loading] {path} ...")
+    with open(path, "rb") as f:
+        obj = pickle.load(f)
+    n_pairs = sum(len(v) for v in obj.values())
+    print(f"  [Checkpoint Loaded] {len(obj):,} entities | {n_pairs:,} candidate pairs ready.")
+    return obj
 
 
 # ─── Sparse Top-K Extraction (Zero Dense Allocation) ─────────────────────────
@@ -223,9 +250,9 @@ def _run_layer1_exact(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame) -> p
 def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                     s1_embeds: np.ndarray, s2_embeds: np.ndarray, s3_embeds: np.ndarray,
                     candidates: dict[str, set[str]],
-                    top_k: int = 35,
-                    min_sim: float = 0.45,
-                    query_batch_size: int = 4096) -> None:
+                    top_k: int = 25,
+                    min_sim: float = 0.55,
+                    query_batch_size: int = 1024) -> None:
     """
     Layer 2: GPU FP16 dense vector ANN search, country-partitioned.
     Streams results DIRECTLY into candidates dictionary in-place.
@@ -281,8 +308,9 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                 can_fit_target_on_gpu = (use_fp16 and n_tgt <= 4_000_000 and total_gpu_mem >= 18 * (1024**3))
 
                 if can_fit_target_on_gpu:
+                    q_batch = 1024
                     print(f"    [{country}] Direct GPU mode: {n_queries:,} queries × {n_tgt:,} targets "
-                          f"(q_batch=512, peak VRAM ~6.5 GB)", flush=True)
+                          f"(q_batch={q_batch}, peak VRAM ~6.5 GB)", flush=True)
 
                     sub_tgt = tgt_embeds[tgt_idx_arr]
                     tgt_t = torch.from_numpy(sub_tgt.astype(np.float16)).to(device)
@@ -290,7 +318,6 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                     tgt_t_T = tgt_t.t().contiguous()
                     del tgt_t
 
-                    q_batch = 512
                     for qb_start in range(0, n_queries, q_batch):
                         qb_end = min(qb_start + q_batch, n_queries)
                         q_embs = country_s1_embs[qb_start:qb_end]
@@ -315,8 +342,8 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                             for rank in range(k):
                                 if len(cset) >= MAX_CANDS_PER_S1:
                                     break
-                                # Keep semantic matches (score >= min_sim) OR top 5 closest
-                                if s_row[rank] >= min_sim or rank < 5:
+                                # Keep top 3 unconditionally, or any semantic match with similarity >= min_sim
+                                if rank < 3 or s_row[rank] >= min_sim:
                                     loc = idx_row[rank]
                                     if loc >= 0:
                                         cset.add(country_tgt_ids[loc])
@@ -400,7 +427,7 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                             for rank in range(k):
                                 if len(cset) >= MAX_CANDS_PER_S1:
                                     break
-                                if s_row[rank] >= min_sim or rank < 5:
+                                if rank < 3 or s_row[rank] >= min_sim:
                                     loc = idx_row[rank]
                                     if loc >= 0:
                                         cset.add(country_tgt_ids[loc])
@@ -430,25 +457,31 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
 
 def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                              candidates: dict[str, set[str]],
-                             forward_top_k: int = 35,
-                             reverse_top_k: int = 5,
-                             batch_size: int = 5000) -> None:
+                             forward_top_k: int = 25,
+                             batch_size: int = 2000) -> None:
     """
-    Layer 3: Single-pass fused TF-IDF blocking.
+    Layer 3: Ultra-lightweight sequential 2-pass TF-IDF blocking.
     Streams results directly into `candidates` dictionary.
-    Zero intermediate Polars DataFrames, peak RAM < 4 GB.
+
+    Pass 1: Combined Word TF-IDF (norm_name + ' ' + norm_addr)
+            analyzer='word', ngram_range=(1, 2), max_df=0.20, min_df=2, max_features=120_000
+    Pass 2: Typo-Robust Char-WB 4-gram TF-IDF (norm_name_nospace)
+            analyzer='char_wb', ngram_range=(4, 4), max_df=0.10, min_df=5, max_features=80_000
+
+    Zero simultaneous dot products, memory freed between passes.
+    Peak RAM < 1.5 GB (prevents Linux OOM crash). Runtime < 2 min.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
 
     t0 = time.time()
-    print(f"\n[Layer 3/4] Single-Pass Fused TF-IDF (fwd top-{forward_top_k}, rev top-{reverse_top_k}) ...")
+    print(f"\n[Layer 3/4] Ultra-Lightweight 2-Pass TF-IDF (fwd top-{forward_top_k}) ...")
 
     countries = sorted(set(s1["country"].to_list()))
 
     for tgt_name, tgt in [("S2", s2), ("S3", s3)]:
         tgt_countries = set(tgt["country"].to_list())
 
-        for country in tqdm(countries, desc=f"  Fused TF-IDF → {tgt_name}"):
+        for country in countries:
             if country not in tgt_countries:
                 continue
 
@@ -462,15 +495,14 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 n_tgt = len(tgt_ids)
 
                 if n_s1 == 0 or n_tgt == 0:
+                    del s1_c, tgt_c
                     continue
 
-                # Extract texts once
                 s1_names = s1_c["norm_name"].fill_null("").to_list()
                 tgt_names = tgt_c["norm_name"].fill_null("").to_list()
                 s1_addrs = s1_c["norm_addr"].fill_null("").to_list()
                 tgt_addrs = tgt_c["norm_addr"].fill_null("").to_list()
 
-                # Nospace names for char-gram
                 ns_col = "norm_name_nospace" if "norm_name_nospace" in s1_c.columns else "norm_name"
                 s1_names_ns = s1_c[ns_col].fill_null("").to_list()
                 tgt_names_ns = tgt_c[ns_col].fill_null("").to_list() if ns_col in tgt_c.columns else tgt_names
@@ -478,61 +510,35 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 del s1_c, tgt_c
                 gc.collect()
 
-                print(f"    [{country}] Vectorizing {n_tgt:,} targets + {n_s1:,} queries (3 signals) ...", flush=True)
+                # ── Pass 1: Combined Word TF-IDF (Name + Address) ─────────
+                print(f"    [{country}→{tgt_name}] Pass 1/2: Word TF-IDF ({n_s1:,} queries × {n_tgt:,} targets) ...", flush=True)
+                s1_combined = [f"{n} {a}".strip() for n, a in zip(s1_names, s1_addrs)]
+                tgt_combined = [f"{n} {a}".strip() for n, a in zip(tgt_names, tgt_addrs)]
+                del s1_addrs, tgt_addrs
 
-                # ── Signal A: Name word TF-IDF ────────────────────────────
-                tfidf_name = TfidfVectorizer(
+                tfidf_word = TfidfVectorizer(
                     analyzer="word", ngram_range=(1, 2),
-                    max_df=0.30, min_df=2, max_features=200_000,
+                    max_df=0.20, min_df=2, max_features=120_000,
                     stop_words="english", sublinear_tf=True, dtype=np.float32,
                 )
-                tgt_name_vecs = tfidf_name.fit_transform(tgt_names)
-                s1_name_vecs = tfidf_name.transform(s1_names)
-                del tfidf_name
+                tgt_word_vecs = tfidf_word.fit_transform(tgt_combined)
+                s1_word_vecs = tfidf_word.transform(s1_combined)
+                del tfidf_word, s1_combined, tgt_combined
                 gc.collect()
 
-                # ── Signal B: Address word TF-IDF ─────────────────────────
-                tfidf_addr = TfidfVectorizer(
-                    analyzer="word", ngram_range=(1, 1),
-                    max_df=0.30, min_df=2, max_features=150_000,
-                    stop_words="english", sublinear_tf=True, dtype=np.float32,
-                )
-                tgt_addr_vecs = tfidf_addr.fit_transform(tgt_addrs)
-                s1_addr_vecs = tfidf_addr.transform(s1_addrs)
-                del tfidf_addr
+                tgt_word_T = tgt_word_vecs.T.tocsc()
+                del tgt_word_vecs
                 gc.collect()
 
-                # ── Signal C: Name char 4-gram TF-IDF ─────────────────────
-                tfidf_char = TfidfVectorizer(
-                    analyzer="char", ngram_range=(3, 5),
-                    max_df=0.40, min_df=2, max_features=200_000,
-                    sublinear_tf=True, dtype=np.float32,
-                )
-                tgt_char_vecs = tfidf_char.fit_transform(tgt_names_ns)
-                s1_char_vecs = tfidf_char.transform(s1_names_ns)
-                del tfidf_char
-                gc.collect()
-
-                del s1_names, tgt_names, s1_addrs, tgt_addrs, s1_names_ns, tgt_names_ns
-
-                # ── Fused Retrieval: Forward (S1 → Target) ────────────────
-                tgt_name_T = tgt_name_vecs.T.tocsc()
-                tgt_addr_T = tgt_addr_vecs.T.tocsc()
-                tgt_char_T = tgt_char_vecs.T.tocsc()
-
+                added_p1 = 0
                 for b_start in tqdm(range(0, n_s1, batch_size),
                                     total=(n_s1 + batch_size - 1) // batch_size,
-                                    desc=f"    [{country}] Forward fused retrieval",
+                                    desc=f"      Pass 1 (Word)",
                                     leave=False):
                     b_end = min(b_start + batch_size, n_s1)
-
-                    sim_name = s1_name_vecs[b_start:b_end].dot(tgt_name_T)
-                    sim_addr = s1_addr_vecs[b_start:b_end].dot(tgt_addr_T)
-                    sim_char = s1_char_vecs[b_start:b_end].dot(tgt_char_T)
-
-                    fused = sim_name.maximum(sim_addr).maximum(sim_char)
-                    top_indices = _extract_sparse_topk(fused.tocsr(), top_k=forward_top_k, min_score=0.03)
-                    del sim_name, sim_addr, sim_char, fused
+                    sim_batch = s1_word_vecs[b_start:b_end].dot(tgt_word_T)
+                    top_indices = _extract_sparse_topk(sim_batch.tocsr(), top_k=forward_top_k, min_score=0.10)
+                    del sim_batch
 
                     for qi, col_indices in enumerate(top_indices):
                         if col_indices:
@@ -541,44 +547,53 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                             for c_idx in col_indices:
                                 if len(cset) < MAX_CANDS_PER_S1:
                                     cset.add(tgt_ids[c_idx])
+                                    added_p1 += 1
 
-                del tgt_name_T, tgt_addr_T, tgt_char_T
+                # Clean Pass 1 matrices completely before Pass 2
+                del tgt_word_T, s1_word_vecs
+                gc.collect()
 
-                # ── Fused Retrieval: Reverse (Target → S1) ────────────────
-                s1_name_T = s1_name_vecs.T.tocsc()
-                s1_addr_T = s1_addr_vecs.T.tocsc()
-                s1_char_T = s1_char_vecs.T.tocsc()
+                # ── Pass 2: Typo-Robust Char-WB 4-gram TF-IDF (Name Only) ──
+                print(f"    [{country}→{tgt_name}] Pass 2/2: Char-WB 4-gram TF-IDF ...", flush=True)
+                tfidf_char = TfidfVectorizer(
+                    analyzer="char_wb", ngram_range=(4, 4),
+                    max_df=0.10, min_df=5, max_features=80_000,
+                    sublinear_tf=True, dtype=np.float32,
+                )
+                tgt_char_vecs = tfidf_char.fit_transform(tgt_names_ns)
+                s1_char_vecs = tfidf_char.transform(s1_names_ns)
+                del tfidf_char, s1_names, tgt_names, s1_names_ns, tgt_names_ns
+                gc.collect()
 
-                for b_start in tqdm(range(0, n_tgt, batch_size),
-                                    total=(n_tgt + batch_size - 1) // batch_size,
-                                    desc=f"    [{country}] Reverse retrieval",
+                tgt_char_T = tgt_char_vecs.T.tocsc()
+                del tgt_char_vecs
+                gc.collect()
+
+                added_p2 = 0
+                for b_start in tqdm(range(0, n_s1, batch_size),
+                                    total=(n_s1 + batch_size - 1) // batch_size,
+                                    desc=f"      Pass 2 (Char-WB)",
                                     leave=False):
-                    b_end = min(b_start + batch_size, n_tgt)
+                    b_end = min(b_start + batch_size, n_s1)
+                    sim_batch = s1_char_vecs[b_start:b_end].dot(tgt_char_T)
+                    top_indices = _extract_sparse_topk(sim_batch.tocsr(), top_k=15, min_score=0.15)
+                    del sim_batch
 
-                    sim_name = tgt_name_vecs[b_start:b_end].dot(s1_name_T)
-                    sim_addr = tgt_addr_vecs[b_start:b_end].dot(s1_addr_T)
-                    sim_char = tgt_char_vecs[b_start:b_end].dot(s1_char_T)
-
-                    fused = sim_name.maximum(sim_addr).maximum(sim_char)
-                    top_indices = _extract_sparse_topk(fused.tocsr(), top_k=reverse_top_k, min_score=0.03)
-                    del sim_name, sim_addr, sim_char, fused
-
-                    for qi, s1_col_indices in enumerate(top_indices):
-                        if s1_col_indices:
-                            tgt_id = tgt_ids[b_start + qi]
-                            for s1_col_idx in s1_col_indices:
-                                s1_id = s1_ids[s1_col_idx]
-                                cset = candidates[s1_id]
+                    for qi, col_indices in enumerate(top_indices):
+                        if col_indices:
+                            s1_id = s1_ids[b_start + qi]
+                            cset = candidates[s1_id]
+                            for c_idx in col_indices:
                                 if len(cset) < MAX_CANDS_PER_S1:
-                                    cset.add(tgt_id)
+                                    cset.add(tgt_ids[c_idx])
+                                    added_p2 += 1
 
-                del s1_name_T, s1_addr_T, s1_char_T
-                del s1_name_vecs, s1_addr_vecs, s1_char_vecs
-                del tgt_name_vecs, tgt_addr_vecs, tgt_char_vecs
+                # Clean Pass 2 matrices completely
+                del tgt_char_T, s1_char_vecs, s1_ids, tgt_ids
                 gc.collect()
 
             except Exception as e:
-                print(f"  [WARNING] Fused TF-IDF for {country}→{tgt_name} failed: {e}")
+                print(f"  [WARNING] 2-Pass TF-IDF for {country}→{tgt_name} failed: {e}")
                 traceback.print_exc()
                 gc.collect()
 
@@ -733,71 +748,115 @@ def generate_candidates(s1: pl.DataFrame,
                         s2_embeds: np.ndarray,
                         s3_embeds: np.ndarray,
                         top_k: int = ANN_TOP_K,
-                        snm_window: int = 5) -> dict[str, set[str]]:
+                        snm_window: int = 5,
+                        cache_prefix: str = "train_candidates",
+                        force: bool = False) -> dict[str, set[str]]:
     """
-    Generate candidates using 4-Layer Fusion Blocking.
-    Zero-Swap, In-Place Streaming Architecture:
-    - Layer 1: Exact Hash Blocking (Polars joins) -> ingested directly into candidates dict
-    - Layer 2: GPU ANN Dense Vector Search -> streamed directly into candidates dict
-    - Layer 3: Single-Pass Fused TF-IDF -> streamed directly into candidates dict
-    - Layer 4: Token Overlap Safety Net -> streamed directly into candidates dict
+    Generate candidates using 4-Layer Fusion Blocking with granular checkpoints:
+      Layer 1: Exact Hash Blocking (Polars inner joins) -> saved to {cache_prefix}_l1.pkl
+      Layer 2: GPU ANN Dense Vector Search (FP16 matmul) -> saved to {cache_prefix}_l2.pkl
+      Layer 3: Ultra-Lightweight 2-Pass TF-IDF          -> saved to {cache_prefix}_l3.pkl
+      Layer 4: Token Overlap Safety Net (<5 candidates) -> saved to {cache_prefix}.pkl
 
-    Peak RAM: < 5 GB (eliminates 60 GB Polars DataFrame bloat and swap thrashing).
-    Returns: dict mapping s1_entity_id → set of candidate entity_ids.
+    If kernel restarts or disconnects, execution automatically resumes from the latest
+    saved layer checkpoint, saving all previous work!
     """
     start_time = time.time()
 
     print("\n" + "="*70)
-    print("  4-LAYER FUSION BLOCKING (ZERO-SWAP DIRECT STREAMING)")
+    print("  4-LAYER FUSION BLOCKING (GRANULAR RESUMABLE CHECKPOINTS)")
     print("="*70)
     print(f"  Inputs: S1={len(s1):,} rows | S2={len(s2):,} rows | S3={len(s3):,} rows")
 
-    # Master candidate dictionary: pre-allocate keys for all S1 entities
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+    cp_final = os.path.join(CHECKPOINT_DIR, f"{cache_prefix}.pkl")
+    cp_l3    = os.path.join(CHECKPOINT_DIR, f"{cache_prefix}_l3.pkl")
+    cp_l2    = os.path.join(CHECKPOINT_DIR, f"{cache_prefix}_l2.pkl")
+    cp_l1    = os.path.join(CHECKPOINT_DIR, f"{cache_prefix}_l1.pkl")
+
+    # 0. Check if fully completed
+    if not force and os.path.exists(cp_final):
+        print(f"\n[Checkpoint Resume] Loading completed blocking candidates from: {cp_final}")
+        return _load_pickle(cp_final)
+
     all_s1_ids = s1["entity_id"].to_list()
-    candidates: dict[str, set[str]] = {sid: set() for sid in all_s1_ids}
+    candidates: dict[str, set[str]] = {}
+
+    # 1. Determine resume point
+    resume_layer = 1
+    if not force:
+        if os.path.exists(cp_l3):
+            print(f"\n[Checkpoint Resume] Found Layer 3 checkpoint ({cp_l3}). Resuming at Layer 4...")
+            candidates = _load_pickle(cp_l3)
+            resume_layer = 4
+        elif os.path.exists(cp_l2):
+            print(f"\n[Checkpoint Resume] Found Layer 2 checkpoint ({cp_l2}). Resuming at Layer 3...")
+            candidates = _load_pickle(cp_l2)
+            resume_layer = 3
+        elif os.path.exists(cp_l1):
+            print(f"\n[Checkpoint Resume] Found Layer 1 checkpoint ({cp_l1}). Resuming at Layer 2...")
+            candidates = _load_pickle(cp_l1)
+            resume_layer = 2
+        else:
+            candidates = {sid: set() for sid in all_s1_ids}
+    else:
+        candidates = {sid: set() for sid in all_s1_ids}
+
+    # Ensure all S1 keys exist in candidates
+    for sid in all_s1_ids:
+        if sid not in candidates:
+            candidates[sid] = set()
 
     # ──────────────────────────────────────────────────────────────────────────
     # Layer 1: Exact Key Matching
     # ──────────────────────────────────────────────────────────────────────────
-    l1_df = _run_layer1_exact(s1, s2, s3)
-    t0 = time.time()
-    l1_s1 = l1_df["s1_id"].to_list()
-    l1_cands = l1_df["cand_id"].to_list()
-    del l1_df
-    gc.collect()
+    if resume_layer <= 1:
+        l1_df = _run_layer1_exact(s1, s2, s3)
+        t0 = time.time()
+        l1_s1 = l1_df["s1_id"].to_list()
+        l1_cands = l1_df["cand_id"].to_list()
+        del l1_df
+        gc.collect()
 
-    added_l1 = 0
-    for sid, cid in zip(l1_s1, l1_cands):
-        cset = candidates[sid]
-        if len(cset) < MAX_CANDS_PER_S1:
-            cset.add(cid)
-            added_l1 += 1
-    del l1_s1, l1_cands
-    gc.collect()
-    print(f"  [L1 Ingested] {added_l1:,} pairs merged in {time.time()-t0:.1f}s | "
-          f"Total unique pairs: {sum(len(v) for v in candidates.values()):,}")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Layer 2: GPU ANN (Top-35, Streams directly to candidates dict)
-    # ──────────────────────────────────────────────────────────────────────────
-    ann_k = min(35, max(25, top_k, ANN_TOP_K))
-    _run_layer2_ann(s1, s2, s3, s1_embeds, s2_embeds, s3_embeds, candidates,
-                    top_k=ann_k, min_sim=0.45)
-    gc.collect()
-    print(f"  [L2 Ingested] Cumulative pairs after L1+L2: {sum(len(v) for v in candidates.values()):,}")
+        added_l1 = 0
+        for sid, cid in zip(l1_s1, l1_cands):
+            cset = candidates[sid]
+            if len(cset) < MAX_CANDS_PER_S1:
+                cset.add(cid)
+                added_l1 += 1
+        del l1_s1, l1_cands
+        gc.collect()
+        print(f"  [L1 Ingested] {added_l1:,} pairs merged in {time.time()-t0:.1f}s | "
+              f"Total unique pairs: {sum(len(v) for v in candidates.values()):,}")
+        _save_pickle(candidates, cp_l1)
 
     # ──────────────────────────────────────────────────────────────────────────
-    # Layer 3: Single-Pass Fused TF-IDF (Streams directly to candidates dict)
+    # Layer 2: GPU ANN (Direct Stream to candidates dict)
     # ──────────────────────────────────────────────────────────────────────────
-    _run_layer3_fused_tfidf(s1, s2, s3, candidates, forward_top_k=35, reverse_top_k=5)
-    gc.collect()
-    print(f"  [L3 Ingested] Cumulative pairs after L1+L2+L3: {sum(len(v) for v in candidates.values()):,}")
+    if resume_layer <= 2:
+        ann_k = min(25, max(15, top_k, ANN_TOP_K))
+        _run_layer2_ann(s1, s2, s3, s1_embeds, s2_embeds, s3_embeds, candidates,
+                        top_k=ann_k, min_sim=0.55, query_batch_size=1024)
+        gc.collect()
+        print(f"  [L2 Ingested] Cumulative pairs after L1+L2: {sum(len(v) for v in candidates.values()):,}")
+        _save_pickle(candidates, cp_l2)
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Layer 3: Ultra-Lightweight 2-Pass TF-IDF
+    # ──────────────────────────────────────────────────────────────────────────
+    if resume_layer <= 3:
+        _run_layer3_fused_tfidf(s1, s2, s3, candidates, forward_top_k=25, batch_size=2000)
+        gc.collect()
+        print(f"  [L3 Ingested] Cumulative pairs after L1+L2+L3: {sum(len(v) for v in candidates.values()):,}")
+        _save_pickle(candidates, cp_l3)
 
     # ──────────────────────────────────────────────────────────────────────────
     # Layer 4: Safety Net for under-covered entities (< 5 candidates)
     # ──────────────────────────────────────────────────────────────────────────
-    _run_layer4_safety_net(s1, s2, s3, candidates, min_candidates=5, top_k=10)
-    gc.collect()
+    if resume_layer <= 4:
+        _run_layer4_safety_net(s1, s2, s3, candidates, min_candidates=5, top_k=10)
+        gc.collect()
+        _save_pickle(candidates, cp_final)
 
     total_pairs = sum(len(v) for v in candidates.values())
     n_s1 = len(all_s1_ids)
@@ -808,6 +867,7 @@ def generate_candidates(s1: pl.DataFrame,
     print(f"  Total S1 entities processed: {n_s1:,}")
     print(f"  Total unique candidate pairs: {total_pairs:,}")
     print(f"  Average candidates per S1   : {avg_cands:.1f}")
+    print(f"  Final candidates saved to   : {cp_final}")
     print(f"{'='*70}\n")
 
     return candidates

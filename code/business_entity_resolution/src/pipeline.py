@@ -458,18 +458,10 @@ def stage_blocking_train(s1, s2, s3, e1, e2, e3, force: bool = False):
     print("  STAGE 5: BLOCKING ON TRAIN")
     print("="*60)
 
-    # Check for checkpoint unless forced
-    if not force:
-        cached = load_checkpoint("train_candidates")
-        if cached is not None:
-            print(f"  Using cached candidates ({sum(len(v) for v in cached.values()):,} pairs)")
-            return cached
-
+    # Note: generate_candidates handles granular layer checkpoints (L1, L2, L3, final) internally
     candidates = generate_candidates(s1, s2, s3, e1, e2, e3,
-                                      top_k=ANN_TOP_K, snm_window=SNM_WINDOW)
-
-    # Checkpoint
-    save_checkpoint(candidates, "train_candidates")
+                                      top_k=ANN_TOP_K, snm_window=SNM_WINDOW,
+                                      cache_prefix="train_candidates", force=force)
     return candidates
 
 
@@ -479,16 +471,9 @@ def stage_blocking_test(ts1, ts2, ts3, te1, te2, te3, force: bool = False):
     print("  STAGE 6: BLOCKING ON TEST")
     print("="*60)
 
-    if not force:
-        cached = load_checkpoint("test_candidates")
-        if cached is not None:
-            print(f"  Using cached candidates ({sum(len(v) for v in cached.values()):,} pairs)")
-            return cached
-
     test_candidates = generate_candidates(ts1, ts2, ts3, te1, te2, te3,
-                                           top_k=ANN_TOP_K, snm_window=SNM_WINDOW)
-
-    save_checkpoint(test_candidates, "test_candidates")
+                                           top_k=ANN_TOP_K, snm_window=SNM_WINDOW,
+                                           cache_prefix="test_candidates", force=force)
     return test_candidates
 
 
