@@ -164,7 +164,7 @@ def score_candidates(
 
     pbar = tqdm(active_s1_ids, desc="Scoring entities", unit="entities")
     for s1_id in pbar:
-        cands = candidates.get(s1_id, set())
+        cands = candidates.get(s1_id)
         if not cands or s1_id not in lookup_all:
             continue
         rec_a = lookup_all[s1_id]
@@ -172,34 +172,46 @@ def score_candidates(
         name_a = rec_a.get("norm_name_ns", "")
         name_a_sort = rec_a.get("norm_name", "")
 
-        valid_cands = [cid for cid in cands if cid in lookup_all]
-        if not valid_cands:
-            continue
-        total_screened += len(valid_cands)
+        selected_cands = []
+        best_cos = -1.0
+        best_cid = None
+        second_cos = -1.0
+        second_cid = None
 
-        # 1. Exact name matches (instant string equality)
-        exact_matches = [
-            cid for cid in valid_cands
-            if (name_a and lookup_all[cid].get("norm_name_ns") == name_a)
-            or (name_a_sort and lookup_all[cid].get("norm_name") == name_a_sort)
-        ]
+        for cid in cands:
+            if cid not in lookup_all:
+                continue
+            total_screened += 1
+            rec_b = lookup_all[cid]
 
-        # 2. Embedding cosine similarities (keep top-2 candidates with cos >= 0.45)
-        if va is not None:
-            cand_cos = []
-            for cid in valid_cands:
-                vb = lookup_all[cid].get("embed_vec")
+            # 1. Exact name match (instant match)
+            name_b = rec_b.get("norm_name_ns", "")
+            if name_a and name_b == name_a:
+                selected_cands.append(cid)
+                continue
+            if name_a_sort and rec_b.get("norm_name", "") == name_a_sort:
+                selected_cands.append(cid)
+                continue
+
+            # 2. Embedding cosine (O(1) tracking of top 2)
+            if va is not None:
+                vb = rec_b.get("embed_vec")
                 if vb is not None:
                     cos = float(np.dot(va, vb))
-                    if cos >= 0.45:
-                        cand_cos.append((cid, cos))
-            cand_cos.sort(key=lambda x: x[1], reverse=True)
-            top_cos = [cid for cid, _ in cand_cos[:2]]
-        else:
-            top_cos = valid_cands[:2]
+                    if cos >= 0.50:
+                        if cos > best_cos:
+                            second_cos, second_cid = best_cos, best_cid
+                            best_cos, best_cid = cos, cid
+                        elif cos > second_cos:
+                            second_cos, second_cid = cos, cid
 
-        # Union of exact matches and top-2 cosine candidates
-        selected_cands = set(exact_matches) | set(top_cos)
+        if best_cid is not None and best_cid not in selected_cands:
+            selected_cands.append(best_cid)
+        if second_cid is not None and second_cid not in selected_cands:
+            selected_cands.append(second_cid)
+
+        if not selected_cands:
+            continue
 
         for s23_id in selected_cands:
             rec_b = lookup_all[s23_id]
