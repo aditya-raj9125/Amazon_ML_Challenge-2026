@@ -170,23 +170,39 @@ def score_candidates(
         rec_a = lookup_all[s1_id]
         va = rec_a.get("embed_vec")
         name_a = rec_a.get("norm_name_ns", "")
-        name_a_words = set(name_a.split()) if name_a else set()
+        name_a_sort = rec_a.get("norm_name", "")
 
-        for s23_id in cands:
-            if s23_id not in lookup_all:
-                continue
-            rec_b = lookup_all[s23_id]
-            total_screened += 1
+        valid_cands = [cid for cid in cands if cid in lookup_all]
+        if not valid_cands:
+            continue
+        total_screened += len(valid_cands)
 
-            # Fast pre-screen: if cosine similarity < 0.25 and zero shared words, skip!
-            name_b = rec_b.get("norm_name_ns", "")
-            if va is not None and name_a and name_b and name_a != name_b:
-                vb = rec_b.get("embed_vec")
+        # 1. Exact name matches (instant string equality)
+        exact_matches = [
+            cid for cid in valid_cands
+            if (name_a and lookup_all[cid].get("norm_name_ns") == name_a)
+            or (name_a_sort and lookup_all[cid].get("norm_name") == name_a_sort)
+        ]
+
+        # 2. Embedding cosine similarities (keep only top-4 candidates with cos >= 0.40)
+        if va is not None:
+            cand_cos = []
+            for cid in valid_cands:
+                vb = lookup_all[cid].get("embed_vec")
                 if vb is not None:
                     cos = float(np.dot(va, vb))
-                    if cos < 0.25 and not (name_a_words & set(name_b.split())):
-                        continue
+                    if cos >= 0.40:
+                        cand_cos.append((cid, cos))
+            cand_cos.sort(key=lambda x: x[1], reverse=True)
+            top_cos = [cid for cid, _ in cand_cos[:4]]
+        else:
+            top_cos = valid_cands[:4]
 
+        # Union of exact matches and top-4 cosine candidates
+        selected_cands = set(exact_matches) | set(top_cos)
+
+        for s23_id in selected_cands:
+            rec_b = lookup_all[s23_id]
             try:
                 fv = build_feature_vector(rec_a, rec_b)
                 batch_rows.append([fv.get(f, 0.0) for f in FEATURE_NAMES])
