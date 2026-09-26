@@ -145,35 +145,24 @@ def score_candidates(
         return scores
 
     # 4. Split active S1 IDs into balanced chunks
-    n_chunks = max(n_workers * 4, 32)
+    n_chunks = max(n_workers * 4, 64)
     chunk_size = max(1, (len(active_s1_ids) + n_chunks - 1) // n_chunks)
     chunks = [active_s1_ids[i:i + chunk_size] for i in range(0, len(active_s1_ids), chunk_size)]
 
-    # 5. Parallel execution with zero-copy shared memory
-    orig_n_jobs = getattr(model, "n_jobs", -1)
-    try:
-        model.set_params(n_jobs=1)
-    except Exception:
-        pass
+    # 5. Multi-process parallel acceleration across all 16 CPU cores (NO GIL contention)
+    from joblib import Parallel, delayed
 
-    try:
-        with ThreadPoolExecutor(max_workers=n_workers) as executor:
-            futures = {
-                executor.submit(_score_chunk, c, candidates, lookup_all, model, threshold=threshold, batch_size=batch_size): i
-                for i, c in enumerate(chunks)
-            }
-            for future in tqdm(as_completed(futures), total=len(chunks), desc="Parallel scoring chunks"):
-                sub_scores = future.result()
-                for sid, cdict in sub_scores.items():
-                    if sid in scores:
-                        scores[sid].update(cdict)
-                    else:
-                        scores[sid] = cdict
-    finally:
-        try:
-            model.set_params(n_jobs=orig_n_jobs)
-        except Exception:
-            pass
+    results = Parallel(n_jobs=n_workers, backend="loky", batch_size=1)(
+        delayed(_score_chunk)(c, candidates, lookup_all, model, threshold=threshold, batch_size=batch_size)
+        for c in tqdm(chunks, desc="Parallel scoring chunks")
+    )
+
+    for sub_scores in results:
+        for sid, cdict in sub_scores.items():
+            if sid in scores:
+                scores[sid].update(cdict)
+            else:
+                scores[sid] = cdict
 
     total_accepted = sum(len(v) for v in scores.values())
     print(f"  Parallel scoring complete! Total accepted matches (prob >= {threshold:.4f}): {total_accepted:,}")
