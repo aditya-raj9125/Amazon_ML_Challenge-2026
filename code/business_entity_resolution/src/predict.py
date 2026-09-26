@@ -184,21 +184,21 @@ def score_candidates(
             or (name_a_sort and lookup_all[cid].get("norm_name") == name_a_sort)
         ]
 
-        # 2. Embedding cosine similarities (keep only top-4 candidates with cos >= 0.40)
+        # 2. Embedding cosine similarities (keep top-2 candidates with cos >= 0.45)
         if va is not None:
             cand_cos = []
             for cid in valid_cands:
                 vb = lookup_all[cid].get("embed_vec")
                 if vb is not None:
                     cos = float(np.dot(va, vb))
-                    if cos >= 0.40:
+                    if cos >= 0.45:
                         cand_cos.append((cid, cos))
             cand_cos.sort(key=lambda x: x[1], reverse=True)
-            top_cos = [cid for cid, _ in cand_cos[:4]]
+            top_cos = [cid for cid, _ in cand_cos[:2]]
         else:
-            top_cos = valid_cands[:4]
+            top_cos = valid_cands[:2]
 
-        # Union of exact matches and top-4 cosine candidates
+        # Union of exact matches and top-2 cosine candidates
         selected_cands = set(exact_matches) | set(top_cos)
 
         for s23_id in selected_cands:
