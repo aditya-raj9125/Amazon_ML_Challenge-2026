@@ -1,3 +1,6 @@
+# ── Artifacts folder (problem statement, notes — local only) ──────────────────
+Artifacts/
+
 # ── Model artifacts & cached embeddings ───────────────────────────────────────
 # These are large binary files that should NOT be committed.
 # Regenerate them by running the notebook from Cell 5 onward.
