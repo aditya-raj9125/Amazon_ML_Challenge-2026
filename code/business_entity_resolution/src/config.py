@@ -136,8 +136,8 @@ SNM_WINDOW = 5    # sorted-neighborhood sliding window width (used in fallback)
 
 # TF-IDF blocking parameters (from teammate's best config)
 TFIDF_COMB_K = 50    # combined name+addr word TF-IDF top-K
-TFIDF_ADDR_K = 25    # address-only TF-IDF top-K
-TFIDF_CHAR_K = 12    # char 4-gram no-space name TF-IDF top-K
+TFIDF_ADDR_K = 20    # address-only TF-IDF top-K
+TFIDF_CHAR_K = 15    # char 4-gram no-space name TF-IDF top-K
 TFIDF_REV_K  = 5     # reverse (pool→S1) top-K
 
 # Cross-country safety-net (insurance against France mislabelling)
