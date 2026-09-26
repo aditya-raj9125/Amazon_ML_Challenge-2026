@@ -221,6 +221,7 @@ def _get_tfidf_matches_sparse(s1: pl.DataFrame,
             if not s1_texts or not tgt_texts:
                 continue
 
+            print(f"    [{country}] Vectorizing {len(tgt_texts):,} targets + {len(s1_texts):,} queries ...", flush=True)
             tfidf = TfidfVectorizer(
                 analyzer=analyzer,
                 ngram_range=ngram_range,
@@ -243,8 +244,12 @@ def _get_tfidf_matches_sparse(s1: pl.DataFrame,
             n_s1 = s1_vecs.shape[0]
             matched_s1 = []
             matched_cands = []
+            n_batches = (n_s1 + batch_size - 1) // batch_size
 
-            for b_start in range(0, n_s1, batch_size):
+            for b_start in tqdm(range(0, n_s1, batch_size),
+                                total=n_batches,
+                                desc=f"    [{country}] Matching {n_s1:,} queries",
+                                leave=False):
                 b_end = min(b_start + batch_size, n_s1)
                 batch_vecs = s1_vecs[b_start:b_end]
 
@@ -314,6 +319,7 @@ def _get_tfidf_addr_guarded_matches(s1: pl.DataFrame,
             if not s1_addrs or not tgt_addrs:
                 continue
 
+            print(f"    [{country}] Vectorizing {len(tgt_addrs):,} addresses + {len(s1_addrs):,} queries ...", flush=True)
             tfidf = TfidfVectorizer(
                 analyzer="word",
                 ngram_range=(1, 1),
@@ -336,8 +342,12 @@ def _get_tfidf_addr_guarded_matches(s1: pl.DataFrame,
             n_s1 = s1_vecs.shape[0]
             matched_s1 = []
             matched_cands = []
+            n_batches = (n_s1 + batch_size - 1) // batch_size
 
-            for b_start in range(0, n_s1, batch_size):
+            for b_start in tqdm(range(0, n_s1, batch_size),
+                                total=n_batches,
+                                desc=f"    [{country}] Guarded matching",
+                                leave=False):
                 b_end = min(b_start + batch_size, n_s1)
                 batch_vecs = s1_vecs[b_start:b_end]
 
@@ -447,6 +457,7 @@ def _get_reverse_tfidf_matches_sparse(s1: pl.DataFrame,
             if not s1_texts or not tgt_texts:
                 continue
 
+            print(f"    [{country}] Vectorizing {len(s1_texts):,} S1 + {len(tgt_texts):,} targets ...", flush=True)
             tfidf = TfidfVectorizer(
                 analyzer="word",
                 ngram_range=(1, 1),
@@ -469,8 +480,12 @@ def _get_reverse_tfidf_matches_sparse(s1: pl.DataFrame,
             n_tgt = tgt_vecs.shape[0]
             matched_s1 = []
             matched_cands = []
+            n_batches = (n_tgt + batch_size - 1) // batch_size
 
-            for b_start in range(0, n_tgt, batch_size):
+            for b_start in tqdm(range(0, n_tgt, batch_size),
+                                total=n_batches,
+                                desc=f"    [{country}] Reverse matching",
+                                leave=False):
                 b_end = min(b_start + batch_size, n_tgt)
                 batch_vecs = tgt_vecs[b_start:b_end]
 
@@ -597,7 +612,11 @@ def _get_ann_matches(s1: pl.DataFrame,
             else:
                 country_s1_embs = country_s1_embs.astype(np.float32)
 
-            for b_start in range(0, n_queries, query_batch_size):
+            n_ann_batches = (n_queries + query_batch_size - 1) // query_batch_size
+            for b_start in tqdm(range(0, n_queries, query_batch_size),
+                                total=n_ann_batches,
+                                desc=f"    [{country}] GPU ANN {n_queries:,} queries",
+                                leave=False):
                 b_end = min(b_start + query_batch_size, n_queries)
                 b_embs = country_s1_embs[b_start:b_end]
 
