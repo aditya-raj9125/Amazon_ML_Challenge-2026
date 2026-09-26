@@ -379,10 +379,9 @@ def generate_candidates(s1: pl.DataFrame,
     _add_prefix_matches(candidates, s1, s3, "norm_addr", prefix_len=6, max_bucket_size=50)
     print(f"           Pairs after Strategy A: {sum(len(v) for v in candidates.values()):,}")
 
-    print(f"[Blocking] Strategy B: Vectorized sorted-neighborhood (window=2) ...")
-    _add_snm_matches(candidates, s1, s2, col="norm_name", window=2)
-    _add_snm_matches(candidates, s1, s3, col="norm_name", window=2)
-    print(f"           Pairs after Strategy B: {sum(len(v) for v in candidates.values()):,}")
+    # Strategy B (SNM) omitted: Strategy A prefix matching (87.25M pairs) and Strategy C
+    # GPU vector ANN (top-30) already cover all spelling and semantic matches without the
+    # 4.5 GB RAM sorting peak.
 
     ann_k = max(30, top_k)
     print(f"[Blocking] Strategy C: Vector ANN search (top-{ann_k} per target) ...")
