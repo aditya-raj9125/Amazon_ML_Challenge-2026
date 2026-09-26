@@ -131,7 +131,7 @@ VAL_FRACTION = 0.20
 RANDOM_SEED  = 42
 
 # ─── Blocking Parameters ──────────────────────────────────────────────────────
-ANN_TOP_K  = 30   # ANN top-k neighbours per S1 entity per source
+ANN_TOP_K  = 50   # ANN top-k neighbours per S1 entity per source (bumped for 99.9% recall)
 SNM_WINDOW = 5    # sorted-neighborhood sliding window width (used in fallback)
 
 # TF-IDF blocking parameters (from teammate's best config)
