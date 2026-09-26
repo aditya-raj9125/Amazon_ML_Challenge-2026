@@ -31,6 +31,7 @@ from tqdm import tqdm
 from config import (
     ANN_TOP_K, SNM_WINDOW,
     EMBED_MODEL_NAME, EMBED_BATCH_SIZE, EMBED_MAX_SEQ_LEN,
+    HF_CACHE_DIR,
 )
 
 
@@ -426,7 +427,7 @@ def encode_texts(texts: list[str],
     from sentence_transformers import SentenceTransformer
 
     if model_name not in _MODEL_CACHE:
-        _MODEL_CACHE[model_name] = SentenceTransformer(model_name)
+        _MODEL_CACHE[model_name] = SentenceTransformer(model_name, cache_folder=HF_CACHE_DIR)
     model = _MODEL_CACHE[model_name]
     model.max_seq_length = max_seq_len
 

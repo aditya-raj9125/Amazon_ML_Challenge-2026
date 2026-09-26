@@ -26,6 +26,21 @@ import os
 # Going up 3 directory levels reaches the actual repo root.
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
+# ─── EBS Cache & Temp Directories (redirect off small root OS partition) ─────
+CACHE_DIR       = os.path.join(REPO_ROOT, ".cache")
+HF_CACHE_DIR    = os.path.join(CACHE_DIR, "huggingface")
+TORCH_CACHE_DIR = os.path.join(CACHE_DIR, "torch")
+TMP_DIR         = os.path.join(CACHE_DIR, "tmp")
+
+os.makedirs(HF_CACHE_DIR, exist_ok=True)
+os.makedirs(TORCH_CACHE_DIR, exist_ok=True)
+os.makedirs(TMP_DIR, exist_ok=True)
+
+os.environ["HF_HOME"] = HF_CACHE_DIR
+os.environ["TRANSFORMERS_CACHE"] = HF_CACHE_DIR
+os.environ["TORCH_HOME"] = TORCH_CACHE_DIR
+os.environ["TMPDIR"] = TMP_DIR
+
 # ─── Data Root ───────────────────────────────────────────────────────────────
 def _is_valid_data_root(path: str) -> bool:
     """True if the directory actually contains training TSV files."""
