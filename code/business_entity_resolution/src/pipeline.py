@@ -640,8 +640,11 @@ def stage_inference(model, threshold, ts1, test_candidates, test_lookup_all):
     print("\n" + "="*60)
     print("  STAGE 15: TEST SET INFERENCE")
     print("="*60)
+    import importlib
+    import predict
+    importlib.reload(predict)
     test_s1_ids = ts1["entity_id"].to_list()
-    predictions = run_inference(
+    predictions = predict.run_inference(
         model=model,
         threshold=threshold,
         test_s1_ids=test_s1_ids,
