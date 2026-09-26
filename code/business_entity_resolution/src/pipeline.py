@@ -452,17 +452,18 @@ def stage_add_norm_cols(df: pl.DataFrame) -> pl.DataFrame:
     return df
 
 
-def stage_blocking_train(s1, s2, s3, e1, e2, e3):
+def stage_blocking_train(s1, s2, s3, e1, e2, e3, force: bool = False):
     """Stage 5 — Generate candidate pairs for the TRAINING set."""
     print("\n" + "="*60)
     print("  STAGE 5: BLOCKING ON TRAIN")
     print("="*60)
 
-    # Check for checkpoint
-    cached = load_checkpoint("train_candidates")
-    if cached is not None:
-        print(f"  Using cached candidates ({sum(len(v) for v in cached.values()):,} pairs)")
-        return cached
+    # Check for checkpoint unless forced
+    if not force:
+        cached = load_checkpoint("train_candidates")
+        if cached is not None:
+            print(f"  Using cached candidates ({sum(len(v) for v in cached.values()):,} pairs)")
+            return cached
 
     candidates = generate_candidates(s1, s2, s3, e1, e2, e3,
                                       top_k=ANN_TOP_K, snm_window=SNM_WINDOW)
@@ -472,16 +473,17 @@ def stage_blocking_train(s1, s2, s3, e1, e2, e3):
     return candidates
 
 
-def stage_blocking_test(ts1, ts2, ts3, te1, te2, te3):
+def stage_blocking_test(ts1, ts2, ts3, te1, te2, te3, force: bool = False):
     """Stage 6 — Generate candidate pairs for the TEST set."""
     print("\n" + "="*60)
     print("  STAGE 6: BLOCKING ON TEST")
     print("="*60)
 
-    cached = load_checkpoint("test_candidates")
-    if cached is not None:
-        print(f"  Using cached candidates ({sum(len(v) for v in cached.values()):,} pairs)")
-        return cached
+    if not force:
+        cached = load_checkpoint("test_candidates")
+        if cached is not None:
+            print(f"  Using cached candidates ({sum(len(v) for v in cached.values()):,} pairs)")
+            return cached
 
     test_candidates = generate_candidates(ts1, ts2, ts3, te1, te2, te3,
                                            top_k=ANN_TOP_K, snm_window=SNM_WINDOW)

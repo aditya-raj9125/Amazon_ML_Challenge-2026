@@ -309,6 +309,23 @@ def fit_tfidf(texts_name: list[str],
 
 # ─── LightGBM training ───────────────────────────────────────────────────────
 
+def lgb_f05_metric(y_true, y_pred):
+    """Pair-level F0.5 evaluation metric for LightGBM validation monitoring."""
+    if np.any(y_pred < 0) or np.any(y_pred > 1):
+        probs = 1.0 / (1.0 + np.exp(-np.clip(y_pred, -20, 20)))
+    else:
+        probs = y_pred
+    pred_b = (probs >= 0.5).astype(np.int8)
+    tp = np.sum((y_true == 1) & (pred_b == 1))
+    fp = np.sum((y_true == 0) & (pred_b == 1))
+    fn = np.sum((y_true == 1) & (pred_b == 0))
+    p = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    r = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    denom = 0.25 * p + r
+    f05 = (1.25 * p * r / denom) if denom > 1e-9 else 0.0
+    return "f05", f05, True
+
+
 def train_lightgbm(X_train: pd.DataFrame, y_train: np.ndarray,
                    X_val:   pd.DataFrame, y_val:   np.ndarray) -> lgb.LGBMClassifier:
     """
@@ -323,12 +340,15 @@ def train_lightgbm(X_train: pd.DataFrame, y_train: np.ndarray,
     print(f"  Features:  {X_train.shape[1]}")
     print(f"  Params:    num_leaves={LGBM_PARAMS['num_leaves']}, "
           f"n_estimators={LGBM_PARAMS['n_estimators']}, "
-          f"lr={LGBM_PARAMS['learning_rate']}")
+          f"lr={LGBM_PARAMS['learning_rate']}, "
+          f"scale_pos_weight={LGBM_PARAMS['scale_pos_weight']}, "
+          f"n_jobs={LGBM_PARAMS['n_jobs']}")
 
     try:
         model.fit(
             X_train, y_train,
             eval_set=[(X_val, y_val)],
+            eval_metric=lgb_f05_metric,
             callbacks=[
                 lgb.early_stopping(stopping_rounds=LGBM_EARLY_STOPPING_ROUNDS,
                                     verbose=True),

@@ -13,10 +13,10 @@
 #
 # Cell 2 also sets the environment variable AMAZON_ML_DATA to point to that
 # directory so config.py finds it immediately — no filesystem walking needed.
-# SAGEMAKER INSTANCE: ml.g5.2xlarge (32 GB RAM, 75 GB EBS)
-# → Budget: 32 GB RAM (tight — aggressive chunking & memory caps applied)
-# → GPU: 1× NVIDIA A10G (24 GB VRAM) — excellent for embeddings + ANN
-# → vCPUs: 8
+# SAGEMAKER INSTANCE: ml.g5.4xlarge (64 GB RAM, 100+ GB EBS)
+# → Budget: 64 GB RAM (ample headroom for 5M training pairs and 500K S1 groups)
+# → GPU: 1× NVIDIA A10G (24 GB VRAM) — high-speed embeddings + GPU ANN
+# → vCPUs: 16
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -134,7 +134,7 @@ RANDOM_SEED  = 42
 ANN_TOP_K  = 50   # ANN top-k neighbours per S1 entity per source (bumped for 99.9% recall)
 SNM_WINDOW = 5    # sorted-neighborhood sliding window width (used in fallback)
 
-# TF-IDF blocking parameters (from teammate's best config)
+# TF-IDF blocking parameters
 TFIDF_COMB_K = 50    # combined name+addr word TF-IDF top-K
 TFIDF_ADDR_K = 20    # address-only TF-IDF top-K
 TFIDF_CHAR_K = 15    # char 4-gram no-space name TF-IDF top-K
@@ -160,7 +160,8 @@ TFIDF_MAX_FEATURES = 200_000
 # Tuned for high precision (F0.5 is precision-heavy):
 # - 255 leaves (more capacity to learn complex distractor patterns)
 # - 1500 rounds with early stopping
-# - scale_pos_weight < 1 for precision bias
+# - scale_pos_weight = 1.0 (balanced gradients; hard negatives + sweep handle precision)
+# - n_jobs = 16 (matches 16 vCPUs on ml.g5.4xlarge)
 LGBM_PARAMS = {
     "objective":         "binary",
     "metric":            "binary_logloss",
@@ -174,31 +175,30 @@ LGBM_PARAMS = {
     "colsample_bytree":  0.8,
     "reg_alpha":         0.1,
     "reg_lambda":        1.0,
-    # F0.5 is precision-heavy; scale_pos_weight < 1 → more precision.
-    "scale_pos_weight":  0.5,
-    "n_jobs":            8,             # exactly 8 vCPUs on ml.g5.2xlarge
+    "scale_pos_weight":  1.0,
+    "n_jobs":            16,            # 16 vCPUs on ml.g5.4xlarge
     "random_state":      RANDOM_SEED,
     "verbose":           -1,
 }
 
 LGBM_EARLY_STOPPING_ROUNDS = 100    # increased from 50 for more patience
 
-# ─── Training Pair & Memory Bounds (32 GB RAM Safe) ───────────────────────────
+# ─── Training Pair & Memory Bounds (64 GB RAM Safe for ml.g5.4xlarge) ────────
 # Higher ratio = more hard negatives = better distractor discrimination.
-# Capped at 2M total pairs so RAM usage during training stays under 400 MB.
-NEG_TO_POS_RATIO    = 4            # 4:1 negative-to-positive ratio
-MAX_TRAIN_S1_GROUPS = 250_000      # Subsample S1 entities for training (teammate best practice)
-MAX_TRAIN_PAIRS     = 2_000_000    # Strict ceiling on total training pairs (prevents OOM)
-MAX_VAL_SWEEP_S1    = 50_000       # Subsample val S1 entities for threshold sweep
-INFER_BATCH_SIZE    = 50_000       # Streaming batch size for inference
+# 5:1 ratio gives the model ample exposure to subtle house number & abbreviation distractors.
+NEG_TO_POS_RATIO    = 5            # 5:1 negative-to-positive ratio
+MAX_TRAIN_S1_GROUPS = 500_000      # 500K S1 groups for richer training distribution
+MAX_TRAIN_PAIRS     = 5_000_000    # 5M total pairs (~800 MB float32 matrix, easily fits in 64GB RAM)
+MAX_VAL_SWEEP_S1    = 100_000      # 100K val S1 entities for highly accurate threshold sweep
+INFER_BATCH_SIZE    = 100_000      # High-throughput streaming batch size for inference
 
 # ─── Threshold Sweep ─────────────────────────────────────────────────────────
 THRESHOLD_LOW  = 0.30
 THRESHOLD_HIGH = 0.95
-THRESHOLD_STEP = 0.005   # finer resolution (was 0.01)
+THRESHOLD_STEP = 0.002   # ultra-fine resolution for peak F0.5 precision
 
 # ─── Post-processing ──────────────────────────────────────────────────────────
 ENABLE_ONE_TO_ONE_DEDUP    = True
 ENABLE_GRAPH_PRUNING       = True
-GRAPH_PRUNE_MIN_SIMILARITY = 0.25   # name-char3-jaccard floor among matched set
+GRAPH_PRUNE_MIN_SIMILARITY = 0.20   # name-char3-jaccard floor (0.20 preserves borderline recall)
 

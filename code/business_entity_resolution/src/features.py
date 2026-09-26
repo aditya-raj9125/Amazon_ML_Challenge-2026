@@ -114,6 +114,23 @@ def compute_name_features(norm_a: str, norm_a_ns: str,
     else:
         feats["name_edit_sim"]     = float("nan")
 
+    # ── NEW: Edit similarity on names with all spaces stripped (catches "wal mart" vs "walmart")
+    a_nosp = norm_a_ns.replace(" ", "")
+    b_nosp = norm_b_ns.replace(" ", "")
+    if a_nosp or b_nosp:
+        lev_ns = Levenshtein.distance(a_nosp, b_nosp)
+        feats["name_nospace_edit_sim"] = 1.0 - lev_ns / max(len(a_nosp), len(b_nosp), 1)
+    else:
+        feats["name_nospace_edit_sim"] = float("nan")
+
+    # ── NEW: Name prefix match (first 3 characters of space-stripped name)
+    pref_a = a_nosp[:3]
+    pref_b = b_nosp[:3]
+    if len(pref_a) >= 3 and len(pref_b) >= 3:
+        feats["name_prefix_match"] = float(pref_a == pref_b)
+    else:
+        feats["name_prefix_match"] = float("nan")
+
     # RapidFuzz ratios on non-sorted normalised names
     feats["name_token_sort_ratio"] = _safe_fuzz(fuzz.token_sort_ratio, norm_a_ns, norm_b_ns)
     feats["name_partial_ratio"]    = _safe_fuzz(fuzz.partial_ratio, norm_a_ns, norm_b_ns)
@@ -152,6 +169,11 @@ def compute_address_features(norm_a: str, norm_a_ns: str,
     feats["addr_token_jaccard"]    = token_jaccard(norm_a, norm_b)
     feats["addr_token_contain"]    = token_containment(norm_a, norm_b)
     feats["addr_char3_jaccard"]    = char_ngram_jaccard(norm_a, norm_b, n=3)
+
+    # ── NEW: Raw address word overlap count
+    sa_words = set(norm_a.split()) if norm_a else set()
+    sb_words = set(norm_b.split()) if norm_b else set()
+    feats["addr_word_overlap_count"] = float(len(sa_words & sb_words))
 
     if (norm_a_ns or norm_b_ns):
         len_a  = max(len(norm_a_ns), 1)
@@ -331,6 +353,12 @@ def build_feature_vector(rec_a: dict, rec_b: dict) -> dict:
         addr_tj = 0.0
     feats["name_strong_addr_weak"] = float(name_tj > 0.8 and addr_tj < 0.3)
 
+    # ── NEW: Combined score (max of char3 jaccard and bi-encoder cosine)
+    embed_cos = feats.get("embed_cosine", 0.0)
+    if isinstance(embed_cos, float) and math.isnan(embed_cos):
+        embed_cos = 0.0
+    feats["combined_score"] = max(name_j, embed_cos)
+
     return feats
 
 
@@ -341,11 +369,13 @@ FEATURE_NAMES = [
     "name_token_jaccard", "name_token_contain",
     "name_char3_jaccard", "name_char2_jaccard",
     "name_jaro_winkler", "name_edit_sim",
+    "name_nospace_edit_sim", "name_prefix_match",
     "name_token_sort_ratio", "name_partial_ratio",
     "name_length_ratio", "name_token_diff", "name_last_eq",
     # Address features
     "addr_exact", "addr_norm_exact",
     "addr_token_jaccard", "addr_token_contain", "addr_char3_jaccard",
+    "addr_word_overlap_count",
     "addr_edit_sim", "addr_token_sort_ratio", "addr_partial_ratio",
     "addr_length_ratio",
     "addr_empty_a", "addr_empty_b",
@@ -356,5 +386,5 @@ FEATURE_NAMES = [
     "country_equal", "embed_cosine",
     "legal_eq", "legal_either", "name_in_addr_b",
     # Interaction features
-    "name_addr_product", "name_strong_addr_weak",
+    "name_addr_product", "name_strong_addr_weak", "combined_score",
 ]

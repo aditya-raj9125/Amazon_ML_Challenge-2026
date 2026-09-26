@@ -279,95 +279,123 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                 else:
                     country_s1_embs = country_s1_embs.astype(np.float32)
 
-                # Chunk target to avoid OOM:
-                # sim matrix = (q_batch, tgt_chunk) × 2 bytes must fit in ~8 GB
-                # tgt_chunk = 500K, q_batch auto-sized
-                TGT_CHUNK = 500_000
-                n_tgt_chunks = (n_tgt + TGT_CHUNK - 1) // TGT_CHUNK
+                # Determine strategy based on target size & available VRAM
+                # If target fits comfortably in VRAM (<= 4M rows = 3.1 GB FP16) and GPU >= 18 GB:
+                # Load target to GPU ONCE and stream queries with q_batch=512 (peak sim matrix = 3.58 GB).
+                # Total peak VRAM < 6.8 GB on 24 GB A10G, completing in ~15-20 seconds!
+                total_gpu_mem = torch.cuda.get_device_properties(device).total_memory if use_fp16 else 0
+                can_fit_target_on_gpu = (use_fp16 and n_tgt <= 4_000_000 and total_gpu_mem >= 18 * (1024**3))
 
-                # Auto-size query batch: q_batch × tgt_chunk_actual × 2 < 6 GB
-                max_tgt_chunk = min(TGT_CHUNK, n_tgt)
-                q_batch = min(query_batch_size, max(512, int(6e9 / (max_tgt_chunk * 2))))
+                if can_fit_target_on_gpu:
+                    print(f"    [{country}] Direct GPU mode: {n_queries:,} queries × {n_tgt:,} targets "
+                          f"(target stays in VRAM, q_batch=512, peak VRAM ~6.5 GB)", flush=True)
 
-                print(f"    [{country}] {n_queries:,} queries × {n_tgt:,} targets "
-                      f"(tgt_chunks={n_tgt_chunks}, q_batch={q_batch})", flush=True)
+                    sub_tgt = tgt_embeds[tgt_idx_arr]
+                    tgt_t = torch.from_numpy(sub_tgt.astype(np.float16)).to(device)
+                    del sub_tgt
+                    tgt_t_T = tgt_t.t().contiguous()
+                    del tgt_t
 
-                # For each query batch, iterate over target chunks and merge top-k
-                for qb_start in range(0, n_queries, q_batch):
-                    qb_end = min(qb_start + q_batch, n_queries)
-                    q_embs = country_s1_embs[qb_start:qb_end]
-                    q_t = torch.from_numpy(q_embs).to(device)
-                    n_q = qb_end - qb_start
+                    q_batch = 512
+                    for qb_start in range(0, n_queries, q_batch):
+                        qb_end = min(qb_start + q_batch, n_queries)
+                        q_embs = country_s1_embs[qb_start:qb_end]
+                        q_t = torch.from_numpy(q_embs).to(device)
 
-                    # Accumulate top-k scores and indices across target chunks
-                    all_scores = torch.full((n_q, k), -1.0, device=device,
-                                           dtype=torch.float16 if use_fp16 else torch.float32)
-                    all_indices = torch.full((n_q, k), -1, device=device, dtype=torch.long)
+                        sim = torch.mm(q_t, tgt_t_T)
+                        del q_t
 
-                    for tc in range(n_tgt_chunks):
-                        tc_start = tc * TGT_CHUNK
-                        tc_end = min(tc_start + TGT_CHUNK, n_tgt)
-                        tc_size = tc_end - tc_start
+                        _, topk_local_idx = torch.topk(sim, k=k, dim=1)
+                        del sim
 
-                        # Load target chunk to GPU
-                        sub_tgt = tgt_embeds[tgt_idx_arr[tc_start:tc_end]]
-                        if use_fp16:
-                            tgt_chunk_t = torch.from_numpy(sub_tgt.astype(np.float16)).to(device)
-                        else:
-                            tgt_chunk_t = torch.from_numpy(sub_tgt.astype(np.float32)).to(device)
-                        del sub_tgt
+                        topk_np = topk_local_idx.cpu().numpy()
+                        del topk_local_idx
 
-                        # Compute similarity for this chunk
-                        sim_chunk = torch.mm(q_t, tgt_chunk_t.t())
-                        del tgt_chunk_t
+                        n_q = qb_end - qb_start
+                        for qi in range(n_q):
+                            s1_id = country_s1_ids[qb_start + qi]
+                            for loc in topk_np[qi]:
+                                if loc >= 0:
+                                    matched_s1.append(s1_id)
+                                    matched_cands.append(country_tgt_ids[loc])
 
-                        chunk_k = min(k, tc_size)
-                        chunk_scores, chunk_local_idx = torch.topk(sim_chunk, k=chunk_k, dim=1)
-                        del sim_chunk
+                        del topk_np
 
-                        # Offset local indices to global target indices
-                        chunk_global_idx = chunk_local_idx + tc_start
-                        del chunk_local_idx
-
-                        # Merge with accumulated top-k
-                        # Pad chunk results if chunk_k < k
-                        if chunk_k < k:
-                            pad_s = torch.full((n_q, k - chunk_k), -1.0, device=device,
-                                               dtype=chunk_scores.dtype)
-                            pad_i = torch.full((n_q, k - chunk_k), -1, device=device,
-                                               dtype=torch.long)
-                            chunk_scores = torch.cat([chunk_scores, pad_s], dim=1)
-                            chunk_global_idx = torch.cat([chunk_global_idx, pad_i], dim=1)
-                            del pad_s, pad_i
-
-                        combined_scores = torch.cat([all_scores, chunk_scores], dim=1)
-                        combined_indices = torch.cat([all_indices, chunk_global_idx], dim=1)
-                        del chunk_scores, chunk_global_idx
-
-                        top_scores, merge_idx = torch.topk(combined_scores, k=k, dim=1)
-                        all_scores = top_scores
-                        all_indices = combined_indices.gather(1, merge_idx)
-                        del combined_scores, combined_indices, top_scores, merge_idx
-
-                        if device.type == "cuda":
-                            torch.cuda.empty_cache()
-
-                    del q_t
-
-                    # Extract results
-                    topk_np = all_indices.cpu().numpy()
-                    del all_scores, all_indices
-
-                    for qi in range(n_q):
-                        s1_id = country_s1_ids[qb_start + qi]
-                        for loc in topk_np[qi]:
-                            if loc >= 0:
-                                matched_s1.append(s1_id)
-                                matched_cands.append(country_tgt_ids[loc])
-
-                    del topk_np
+                    del tgt_t_T
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
+
+                else:
+                    # Fallback chunking mode (for systems with smaller GPUs or huge target sets)
+                    # sim matrix = (q_batch, tgt_chunk) × 2 bytes <= 1 GB
+                    TGT_CHUNK = 250_000
+                    n_tgt_chunks = (n_tgt + TGT_CHUNK - 1) // TGT_CHUNK
+                    q_batch = 1024
+
+                    print(f"    [{country}] Target-chunked mode: {n_queries:,} queries × {n_tgt:,} targets "
+                          f"(tgt_chunks={n_tgt_chunks}, q_batch={q_batch}, peak VRAM ~1.2 GB)", flush=True)
+
+                    for qb_start in range(0, n_queries, q_batch):
+                        qb_end = min(qb_start + q_batch, n_queries)
+                        q_embs = country_s1_embs[qb_start:qb_end]
+                        q_t = torch.from_numpy(q_embs).to(device)
+                        n_q = qb_end - qb_start
+
+                        all_scores = torch.full((n_q, k), -1.0, device=device,
+                                               dtype=torch.float16 if use_fp16 else torch.float32)
+                        all_indices = torch.full((n_q, k), -1, device=device, dtype=torch.long)
+
+                        for tc in range(n_tgt_chunks):
+                            tc_start = tc * TGT_CHUNK
+                            tc_end = min(tc_start + TGT_CHUNK, n_tgt)
+                            tc_size = tc_end - tc_start
+
+                            sub_tgt = tgt_embeds[tgt_idx_arr[tc_start:tc_end]]
+                            if use_fp16:
+                                tgt_chunk_t = torch.from_numpy(sub_tgt.astype(np.float16)).to(device)
+                            else:
+                                tgt_chunk_t = torch.from_numpy(sub_tgt.astype(np.float32)).to(device)
+                            del sub_tgt
+
+                            sim_chunk = torch.mm(q_t, tgt_chunk_t.t())
+                            del tgt_chunk_t
+
+                            chunk_k = min(k, tc_size)
+                            chunk_scores, chunk_local_idx = torch.topk(sim_chunk, k=chunk_k, dim=1)
+                            del sim_chunk
+
+                            chunk_global_idx = chunk_local_idx + tc_start
+                            del chunk_local_idx
+
+                            if chunk_k < k:
+                                pad_s = torch.full((n_q, k - chunk_k), -1.0, device=device, dtype=chunk_scores.dtype)
+                                pad_i = torch.full((n_q, k - chunk_k), -1, device=device, dtype=torch.long)
+                                chunk_scores = torch.cat([chunk_scores, pad_s], dim=1)
+                                chunk_global_idx = torch.cat([chunk_global_idx, pad_i], dim=1)
+                                del pad_s, pad_i
+
+                            combined_scores = torch.cat([all_scores, chunk_scores], dim=1)
+                            combined_indices = torch.cat([all_indices, chunk_global_idx], dim=1)
+                            del chunk_scores, chunk_global_idx
+
+                            top_scores, merge_idx = torch.topk(combined_scores, k=k, dim=1)
+                            all_scores = top_scores
+                            all_indices = combined_indices.gather(1, merge_idx)
+                            del combined_scores, combined_indices, top_scores, merge_idx
+
+                        del q_t
+
+                        topk_np = all_indices.cpu().numpy()
+                        del all_scores, all_indices
+
+                        for qi in range(n_q):
+                            s1_id = country_s1_ids[qb_start + qi]
+                            for loc in topk_np[qi]:
+                                if loc >= 0:
+                                    matched_s1.append(s1_id)
+                                    matched_cands.append(country_tgt_ids[loc])
+
+                        del topk_np
 
                 del country_s1_embs
                 if device.type == "cuda":
@@ -400,19 +428,9 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
 # ==============================================================================
 # LAYER 3: Single-Pass Fused TF-IDF (ONE Vectorization Per Country)
 # ==============================================================================
-#
-# DESIGN: Instead of 4 separate TF-IDF passes (combined-word, char-4gram,
-# address-guarded, reverse), we build ALL TF-IDF matrices ONCE per country
-# and compute a fused score in a single matmul cycle.
-#
-# Signal fusion formula:
-#   fused_score = 0.5 * name_word_sim + 0.3 * addr_word_sim + 0.2 * name_char_sim
-#
-# We also do bidirectional retrieval (forward + reverse) in the SAME pass.
-# ==============================================================================
 
 def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
-                             forward_top_k: int = 30,
+                             forward_top_k: int = 40,
                              reverse_top_k: int = 5,
                              batch_size: int = 5000) -> pl.DataFrame:
     """
@@ -422,7 +440,6 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
     Also performs reverse (target→S1) retrieval in the same pass.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
-    from scipy.sparse import hstack as sparse_hstack
 
     t0 = time.time()
     print(f"\n[Layer 3/4] Single-Pass Fused TF-IDF (fwd top-{forward_top_k}, rev top-{reverse_top_k}) ...")
@@ -466,9 +483,11 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 print(f"    [{country}] Vectorizing {n_tgt:,} targets + {n_s1:,} queries (3 signals) ...", flush=True)
 
                 # ── Signal A: Name word TF-IDF ────────────────────────────
+                # max_df=0.30 keeps all business keywords (pizza, hotel, store)
+                # while stripping high-frequency noise (>30% of entire country).
                 tfidf_name = TfidfVectorizer(
                     analyzer="word", ngram_range=(1, 2),
-                    max_df=15_000, min_df=2, max_features=200_000,
+                    max_df=0.30, min_df=2, max_features=200_000,
                     stop_words="english", sublinear_tf=True, dtype=np.float32,
                 )
                 tgt_name_vecs = tfidf_name.fit_transform(tgt_names)
@@ -479,7 +498,7 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 # ── Signal B: Address word TF-IDF ─────────────────────────
                 tfidf_addr = TfidfVectorizer(
                     analyzer="word", ngram_range=(1, 1),
-                    max_df=15_000, min_df=2, max_features=150_000,
+                    max_df=0.30, min_df=2, max_features=150_000,
                     stop_words="english", sublinear_tf=True, dtype=np.float32,
                 )
                 tgt_addr_vecs = tfidf_addr.fit_transform(tgt_addrs)
@@ -490,7 +509,7 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 # ── Signal C: Name char 4-gram TF-IDF ─────────────────────
                 tfidf_char = TfidfVectorizer(
                     analyzer="char", ngram_range=(3, 5),
-                    max_df=25_000, min_df=2, max_features=200_000,
+                    max_df=0.40, min_df=2, max_features=200_000,
                     sublinear_tf=True, dtype=np.float32,
                 )
                 tgt_char_vecs = tfidf_char.fit_transform(tgt_names_ns)
@@ -501,7 +520,6 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 del s1_names, tgt_names, s1_addrs, tgt_addrs, s1_names_ns, tgt_names_ns
 
                 # ── Fused Retrieval: Forward (S1 → Target) ────────────────
-                # Transpose target matrices once for dot product
                 tgt_name_T = tgt_name_vecs.T.tocsc()
                 tgt_addr_T = tgt_addr_vecs.T.tocsc()
                 tgt_char_T = tgt_char_vecs.T.tocsc()
@@ -515,18 +533,12 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                                     leave=False):
                     b_end = min(b_start + batch_size, n_s1)
 
-                    # Compute 3 similarity matrices
                     sim_name = s1_name_vecs[b_start:b_end].dot(tgt_name_T)
                     sim_addr = s1_addr_vecs[b_start:b_end].dot(tgt_addr_T)
                     sim_char = s1_char_vecs[b_start:b_end].dot(tgt_char_T)
 
-                    # Fused score: weighted max-of-signals
-                    # Convert to dense only for the batch (small memory footprint)
-                    # Use element-wise max across the 3 sparse matrices
-                    # scipy sparse max is efficient for CSR
                     fused = sim_name.maximum(sim_addr).maximum(sim_char)
-
-                    top_indices = _extract_sparse_topk(fused.tocsr(), top_k=forward_top_k, min_score=0.05)
+                    top_indices = _extract_sparse_topk(fused.tocsr(), top_k=forward_top_k, min_score=0.03)
                     del sim_name, sim_addr, sim_char, fused
 
                     for qi, col_indices in enumerate(top_indices):
@@ -554,7 +566,7 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                     sim_char = tgt_char_vecs[b_start:b_end].dot(s1_char_T)
 
                     fused = sim_name.maximum(sim_addr).maximum(sim_char)
-                    top_indices = _extract_sparse_topk(fused.tocsr(), top_k=reverse_top_k, min_score=0.05)
+                    top_indices = _extract_sparse_topk(fused.tocsr(), top_k=reverse_top_k, min_score=0.03)
                     del sim_name, sim_addr, sim_char, fused
 
                     for qi, s1_col_indices in enumerate(top_indices):
@@ -807,7 +819,7 @@ def generate_candidates(s1: pl.DataFrame,
     # ──────────────────────────────────────────────────────────────────────────
     # Layer 3: Single-Pass Fused TF-IDF
     # ──────────────────────────────────────────────────────────────────────────
-    l3_pairs = _run_layer3_fused_tfidf(s1, s2, s3, forward_top_k=30, reverse_top_k=5)
+    l3_pairs = _run_layer3_fused_tfidf(s1, s2, s3, forward_top_k=40, reverse_top_k=5)
 
     # Merge L1+L2+L3 and deduplicate
     merged_123 = pl.concat([merged_12, l3_pairs]).unique(subset=["s1_id", "cand_id"])
