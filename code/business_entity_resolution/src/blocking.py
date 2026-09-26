@@ -510,20 +510,34 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 del s1_c, tgt_c
                 gc.collect()
 
-                # ── Pass 1: Combined Word TF-IDF (Name + Address) ─────────
-                print(f"    [{country}→{tgt_name}] Pass 1/2: Word TF-IDF ({n_s1:,} queries × {n_tgt:,} targets) ...", flush=True)
-                s1_combined = [f"{n} {a}".strip() for n, a in zip(s1_names, s1_addrs)]
-                tgt_combined = [f"{n} {a}".strip() for n, a in zip(tgt_names, tgt_addrs)]
+                # ── Prioritize entities that need more candidates (< 40) ──
+                needed_mask = [len(candidates.get(sid, ())) < 40 for sid in s1_ids]
+                needed_indices = [i for i, needed in enumerate(needed_mask) if needed]
+                n_needed = len(needed_indices)
+
+                if n_needed == 0:
+                    print(f"    [{country}→{tgt_name}] All S1 entities already have ≥ 40 candidates. Skipping.", flush=True)
+                    del s1_names, tgt_names, s1_addrs, tgt_addrs, s1_names_ns, tgt_names_ns, s1_ids, tgt_ids
+                    gc.collect()
+                    continue
+
+                q_s1_ids = [s1_ids[i] for i in needed_indices]
+                q_names = [s1_names[i] for i in needed_indices]
+                q_names_ns = [s1_names_ns[i] for i in needed_indices]
                 del s1_addrs, tgt_addrs
+
+                # ── Pass 1: Name Word TF-IDF (Distinctive business words) ──
+                batch_size = 10_000
+                print(f"    [{country}→{tgt_name}] Pass 1/2: Name Word TF-IDF ({n_needed:,} queries needing cands × {n_tgt:,} targets) ...", flush=True)
 
                 tfidf_word = TfidfVectorizer(
                     analyzer="word", ngram_range=(1, 2),
-                    max_df=0.20, min_df=2, max_features=120_000,
+                    max_df=0.15, min_df=2, max_features=100_000,
                     stop_words="english", sublinear_tf=True, dtype=np.float32,
                 )
-                tgt_word_vecs = tfidf_word.fit_transform(tgt_combined)
-                s1_word_vecs = tfidf_word.transform(s1_combined)
-                del tfidf_word, s1_combined, tgt_combined
+                tgt_word_vecs = tfidf_word.fit_transform(tgt_names)
+                q_word_vecs = tfidf_word.transform(q_names)
+                del tfidf_word, q_names
                 gc.collect()
 
                 tgt_word_T = tgt_word_vecs.T.tocsc()
@@ -531,38 +545,37 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 gc.collect()
 
                 added_p1 = 0
-                for b_start in tqdm(range(0, n_s1, batch_size),
-                                    total=(n_s1 + batch_size - 1) // batch_size,
-                                    desc=f"      Pass 1 (Word)",
+                for b_start in tqdm(range(0, n_needed, batch_size),
+                                    total=(n_needed + batch_size - 1) // batch_size,
+                                    desc=f"      Pass 1 (Name Word)",
                                     leave=False):
-                    b_end = min(b_start + batch_size, n_s1)
-                    sim_batch = s1_word_vecs[b_start:b_end].dot(tgt_word_T)
-                    top_indices = _extract_sparse_topk(sim_batch.tocsr(), top_k=forward_top_k, min_score=0.10)
+                    b_end = min(b_start + batch_size, n_needed)
+                    sim_batch = q_word_vecs[b_start:b_end].dot(tgt_word_T)
+                    top_indices = _extract_sparse_topk(sim_batch.tocsr(), top_k=forward_top_k, min_score=0.12)
                     del sim_batch
 
                     for qi, col_indices in enumerate(top_indices):
                         if col_indices:
-                            s1_id = s1_ids[b_start + qi]
+                            s1_id = q_s1_ids[b_start + qi]
                             cset = candidates[s1_id]
                             for c_idx in col_indices:
                                 if len(cset) < MAX_CANDS_PER_S1:
                                     cset.add(tgt_ids[c_idx])
                                     added_p1 += 1
 
-                # Clean Pass 1 matrices completely before Pass 2
-                del tgt_word_T, s1_word_vecs
+                del tgt_word_T, q_word_vecs
                 gc.collect()
 
                 # ── Pass 2: Typo-Robust Char-WB 4-gram TF-IDF (Name Only) ──
                 print(f"    [{country}→{tgt_name}] Pass 2/2: Char-WB 4-gram TF-IDF ...", flush=True)
                 tfidf_char = TfidfVectorizer(
                     analyzer="char_wb", ngram_range=(4, 4),
-                    max_df=0.10, min_df=5, max_features=80_000,
+                    max_df=0.08, min_df=5, max_features=60_000,
                     sublinear_tf=True, dtype=np.float32,
                 )
                 tgt_char_vecs = tfidf_char.fit_transform(tgt_names_ns)
-                s1_char_vecs = tfidf_char.transform(s1_names_ns)
-                del tfidf_char, s1_names, tgt_names, s1_names_ns, tgt_names_ns
+                q_char_vecs = tfidf_char.transform(q_names_ns)
+                del tfidf_char, s1_names, tgt_names, s1_names_ns, tgt_names_ns, q_names_ns
                 gc.collect()
 
                 tgt_char_T = tgt_char_vecs.T.tocsc()
@@ -570,26 +583,25 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 gc.collect()
 
                 added_p2 = 0
-                for b_start in tqdm(range(0, n_s1, batch_size),
-                                    total=(n_s1 + batch_size - 1) // batch_size,
+                for b_start in tqdm(range(0, n_needed, batch_size),
+                                    total=(n_needed + batch_size - 1) // batch_size,
                                     desc=f"      Pass 2 (Char-WB)",
                                     leave=False):
-                    b_end = min(b_start + batch_size, n_s1)
-                    sim_batch = s1_char_vecs[b_start:b_end].dot(tgt_char_T)
+                    b_end = min(b_start + batch_size, n_needed)
+                    sim_batch = q_char_vecs[b_start:b_end].dot(tgt_char_T)
                     top_indices = _extract_sparse_topk(sim_batch.tocsr(), top_k=15, min_score=0.15)
                     del sim_batch
 
                     for qi, col_indices in enumerate(top_indices):
                         if col_indices:
-                            s1_id = s1_ids[b_start + qi]
+                            s1_id = q_s1_ids[b_start + qi]
                             cset = candidates[s1_id]
                             for c_idx in col_indices:
                                 if len(cset) < MAX_CANDS_PER_S1:
                                     cset.add(tgt_ids[c_idx])
                                     added_p2 += 1
 
-                # Clean Pass 2 matrices completely
-                del tgt_char_T, s1_char_vecs, s1_ids, tgt_ids
+                del tgt_char_T, q_char_vecs, q_s1_ids, s1_ids, tgt_ids
                 gc.collect()
 
             except Exception as e:
