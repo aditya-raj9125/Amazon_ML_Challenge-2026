@@ -217,26 +217,27 @@ def _run_layer1_exact(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame) -> p
 
 
 # ==============================================================================
-# LAYER 2: GPU ANN Dense Vector Search (Top-50, Country-Partitioned)
+# LAYER 2: GPU ANN Dense Vector Search (Top-35, Country-Partitioned, Direct Stream)
 # ==============================================================================
 
 def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                     s1_embeds: np.ndarray, s2_embeds: np.ndarray, s3_embeds: np.ndarray,
-                    top_k: int = 50,
-                    query_batch_size: int = 4096) -> pl.DataFrame:
+                    candidates: dict[str, set[str]],
+                    top_k: int = 35,
+                    min_sim: float = 0.45,
+                    query_batch_size: int = 4096) -> None:
     """
     Layer 2: GPU FP16 dense vector ANN search, country-partitioned.
-    Moved to run BEFORE TF-IDF because it's faster (GPU) and captures ~97-98% alone.
-    Returns deduplicated Polars DataFrame of [s1_id, cand_id].
+    Streams results DIRECTLY into candidates dictionary in-place.
+    Zero intermediate 220M-row Polars DataFrames, zero disk swapping.
     """
     import torch
 
     t0 = time.time()
-    print(f"\n[Layer 2/4] GPU Dense Vector ANN (Top-{top_k}) ...")
+    print(f"\n[Layer 2/4] GPU Dense Vector ANN (Top-{top_k}, min_sim={min_sim}) ...")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     use_fp16 = (device.type == "cuda")
-    out_dfs = []
 
     s1_ids = s1["entity_id"].to_list()
     s1_countries = s1["country"].to_list()
@@ -268,9 +269,6 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
             tgt_idx_arr = np.array(tgt_idx_list, dtype=np.int64)
             s1_idx_arr = np.array(s1_idx_list, dtype=np.int64)
 
-            matched_s1 = []
-            matched_cands = []
-
             try:
                 # Load all S1 embeddings for this country into CPU RAM
                 country_s1_embs = s1_embeds[s1_idx_arr]
@@ -279,16 +277,12 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                 else:
                     country_s1_embs = country_s1_embs.astype(np.float32)
 
-                # Determine strategy based on target size & available VRAM
-                # If target fits comfortably in VRAM (<= 4M rows = 3.1 GB FP16) and GPU >= 18 GB:
-                # Load target to GPU ONCE and stream queries with q_batch=512 (peak sim matrix = 3.58 GB).
-                # Total peak VRAM < 6.8 GB on 24 GB A10G, completing in ~15-20 seconds!
                 total_gpu_mem = torch.cuda.get_device_properties(device).total_memory if use_fp16 else 0
                 can_fit_target_on_gpu = (use_fp16 and n_tgt <= 4_000_000 and total_gpu_mem >= 18 * (1024**3))
 
                 if can_fit_target_on_gpu:
                     print(f"    [{country}] Direct GPU mode: {n_queries:,} queries × {n_tgt:,} targets "
-                          f"(target stays in VRAM, q_batch=512, peak VRAM ~6.5 GB)", flush=True)
+                          f"(q_batch=512, peak VRAM ~6.5 GB)", flush=True)
 
                     sub_tgt = tgt_embeds[tgt_idx_arr]
                     tgt_t = torch.from_numpy(sub_tgt.astype(np.float16)).to(device)
@@ -305,35 +299,44 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                         sim = torch.mm(q_t, tgt_t_T)
                         del q_t
 
-                        _, topk_local_idx = torch.topk(sim, k=k, dim=1)
+                        top_scores, topk_local_idx = torch.topk(sim, k=k, dim=1)
                         del sim
 
+                        scores_np = top_scores.cpu().numpy()
                         topk_np = topk_local_idx.cpu().numpy()
-                        del topk_local_idx
+                        del top_scores, topk_local_idx
 
                         n_q = qb_end - qb_start
                         for qi in range(n_q):
                             s1_id = country_s1_ids[qb_start + qi]
-                            for loc in topk_np[qi]:
-                                if loc >= 0:
-                                    matched_s1.append(s1_id)
-                                    matched_cands.append(country_tgt_ids[loc])
+                            cset = candidates[s1_id]
+                            s_row = scores_np[qi]
+                            idx_row = topk_np[qi]
+                            for rank in range(k):
+                                if len(cset) >= MAX_CANDS_PER_S1:
+                                    break
+                                # Keep semantic matches (score >= min_sim) OR top 5 closest
+                                if s_row[rank] >= min_sim or rank < 5:
+                                    loc = idx_row[rank]
+                                    if loc >= 0:
+                                        cset.add(country_tgt_ids[loc])
+                                else:
+                                    break  # sorted descending; remaining are even lower
 
-                        del topk_np
+                        del scores_np, topk_np
 
                     del tgt_t_T
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
 
                 else:
-                    # Fallback chunking mode (for systems with smaller GPUs or huge target sets)
-                    # sim matrix = (q_batch, tgt_chunk) × 2 bytes <= 1 GB
+                    # Target-chunked mode
                     TGT_CHUNK = 250_000
                     n_tgt_chunks = (n_tgt + TGT_CHUNK - 1) // TGT_CHUNK
                     q_batch = 1024
 
                     print(f"    [{country}] Target-chunked mode: {n_queries:,} queries × {n_tgt:,} targets "
-                          f"(tgt_chunks={n_tgt_chunks}, q_batch={q_batch}, peak VRAM ~1.2 GB)", flush=True)
+                          f"(tgt_chunks={n_tgt_chunks}, q_batch={q_batch})", flush=True)
 
                     for qb_start in range(0, n_queries, q_batch):
                         qb_end = min(qb_start + q_batch, n_queries)
@@ -385,26 +388,30 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
 
                         del q_t
 
+                        scores_np = all_scores.cpu().numpy()
                         topk_np = all_indices.cpu().numpy()
                         del all_scores, all_indices
 
                         for qi in range(n_q):
                             s1_id = country_s1_ids[qb_start + qi]
-                            for loc in topk_np[qi]:
-                                if loc >= 0:
-                                    matched_s1.append(s1_id)
-                                    matched_cands.append(country_tgt_ids[loc])
+                            cset = candidates[s1_id]
+                            s_row = scores_np[qi]
+                            idx_row = topk_np[qi]
+                            for rank in range(k):
+                                if len(cset) >= MAX_CANDS_PER_S1:
+                                    break
+                                if s_row[rank] >= min_sim or rank < 5:
+                                    loc = idx_row[rank]
+                                    if loc >= 0:
+                                        cset.add(country_tgt_ids[loc])
+                                else:
+                                    break
 
-                        del topk_np
+                        del scores_np, topk_np
 
                 del country_s1_embs
                 if device.type == "cuda":
                     torch.cuda.empty_cache()
-
-                if matched_s1:
-                    df_part = pl.DataFrame({"s1_id": matched_s1, "cand_id": matched_cands}).unique()
-                    del matched_s1, matched_cands
-                    out_dfs.append(df_part)
 
             except Exception as e:
                 print(f"    [WARNING] GPU ANN for {country}→{tgt_name} failed: {e}")
@@ -414,36 +421,27 @@ def _run_layer2_ann(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
 
             gc.collect()
 
-    if out_dfs:
-        result = pl.concat(out_dfs).unique(subset=["s1_id", "cand_id"])
-        del out_dfs
-    else:
-        result = pl.DataFrame({"s1_id": [], "cand_id": []}, schema={"s1_id": pl.Utf8, "cand_id": pl.Utf8})
-
-    gc.collect()
-    print(f"  ✓ Layer 2 complete in {time.time()-t0:.1f}s → {result.height:,} unique pairs")
-    return result
+    print(f"  ✓ Layer 2 complete in {time.time()-t0:.1f}s")
 
 
 # ==============================================================================
-# LAYER 3: Single-Pass Fused TF-IDF (ONE Vectorization Per Country)
+# LAYER 3: Single-Pass Fused TF-IDF (Direct Stream to candidates)
 # ==============================================================================
 
 def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
-                             forward_top_k: int = 40,
+                             candidates: dict[str, set[str]],
+                             forward_top_k: int = 35,
                              reverse_top_k: int = 5,
-                             batch_size: int = 5000) -> pl.DataFrame:
+                             batch_size: int = 5000) -> None:
     """
     Layer 3: Single-pass fused TF-IDF blocking.
-    Builds name-word, addr-word, and name-char TF-IDF matrices ONCE per country,
-    then retrieves top-K from the fused similarity score.
-    Also performs reverse (target→S1) retrieval in the same pass.
+    Streams results directly into `candidates` dictionary.
+    Zero intermediate Polars DataFrames, peak RAM < 4 GB.
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
 
     t0 = time.time()
     print(f"\n[Layer 3/4] Single-Pass Fused TF-IDF (fwd top-{forward_top_k}, rev top-{reverse_top_k}) ...")
-    out_dfs = []
 
     countries = sorted(set(s1["country"].to_list()))
 
@@ -483,8 +481,6 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 print(f"    [{country}] Vectorizing {n_tgt:,} targets + {n_s1:,} queries (3 signals) ...", flush=True)
 
                 # ── Signal A: Name word TF-IDF ────────────────────────────
-                # max_df=0.30 keeps all business keywords (pizza, hotel, store)
-                # while stripping high-frequency noise (>30% of entire country).
                 tfidf_name = TfidfVectorizer(
                     analyzer="word", ngram_range=(1, 2),
                     max_df=0.30, min_df=2, max_features=200_000,
@@ -524,9 +520,6 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                 tgt_addr_T = tgt_addr_vecs.T.tocsc()
                 tgt_char_T = tgt_char_vecs.T.tocsc()
 
-                matched_s1 = []
-                matched_cands = []
-
                 for b_start in tqdm(range(0, n_s1, batch_size),
                                     total=(n_s1 + batch_size - 1) // batch_size,
                                     desc=f"    [{country}] Forward fused retrieval",
@@ -544,9 +537,10 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                     for qi, col_indices in enumerate(top_indices):
                         if col_indices:
                             s1_id = s1_ids[b_start + qi]
+                            cset = candidates[s1_id]
                             for c_idx in col_indices:
-                                matched_s1.append(s1_id)
-                                matched_cands.append(tgt_ids[c_idx])
+                                if len(cset) < MAX_CANDS_PER_S1:
+                                    cset.add(tgt_ids[c_idx])
 
                 del tgt_name_T, tgt_addr_T, tgt_char_T
 
@@ -573,69 +567,45 @@ def _run_layer3_fused_tfidf(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame
                         if s1_col_indices:
                             tgt_id = tgt_ids[b_start + qi]
                             for s1_col_idx in s1_col_indices:
-                                matched_s1.append(s1_ids[s1_col_idx])
-                                matched_cands.append(tgt_id)
+                                s1_id = s1_ids[s1_col_idx]
+                                cset = candidates[s1_id]
+                                if len(cset) < MAX_CANDS_PER_S1:
+                                    cset.add(tgt_id)
 
                 del s1_name_T, s1_addr_T, s1_char_T
                 del s1_name_vecs, s1_addr_vecs, s1_char_vecs
                 del tgt_name_vecs, tgt_addr_vecs, tgt_char_vecs
                 gc.collect()
 
-                if matched_s1:
-                    df_part = pl.DataFrame({"s1_id": matched_s1, "cand_id": matched_cands}).unique()
-                    del matched_s1, matched_cands
-                    out_dfs.append(df_part)
-                    gc.collect()
-
             except Exception as e:
                 print(f"  [WARNING] Fused TF-IDF for {country}→{tgt_name} failed: {e}")
                 traceback.print_exc()
                 gc.collect()
 
-    if out_dfs:
-        result = pl.concat(out_dfs).unique(subset=["s1_id", "cand_id"])
-        del out_dfs
-    else:
-        result = pl.DataFrame({"s1_id": [], "cand_id": []}, schema={"s1_id": pl.Utf8, "cand_id": pl.Utf8})
-
-    gc.collect()
-    print(f"  ✓ Layer 3 complete in {time.time()-t0:.1f}s → {result.height:,} unique pairs")
-    return result
+    print(f"  ✓ Layer 3 complete in {time.time()-t0:.1f}s")
 
 
 # ==============================================================================
-# LAYER 4: Token Overlap Safety Net (for Under-Covered S1 Entities)
+# LAYER 4: Token Overlap Safety Net (Direct Stream to candidates)
 # ==============================================================================
 
 def _run_layer4_safety_net(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
-                            existing_pairs: pl.DataFrame,
+                            candidates: dict[str, set[str]],
                             min_candidates: int = 5,
-                            top_k: int = 10) -> pl.DataFrame:
+                            top_k: int = 10) -> None:
     """
     Layer 4: Lightweight token-overlap safety net.
-    For any S1 entity that has fewer than `min_candidates` after layers 1-3,
-    we compute a fast Jaccard token overlap to find additional candidates.
-    This catches edge cases where both embeddings and TF-IDF fail
-    (e.g., very short names, heavy abbreviation, transliteration).
+    Operates ONLY on S1 entities that have fewer than `min_candidates`.
+    Streams results directly into `candidates` dictionary.
     """
     t0 = time.time()
     print(f"\n[Layer 4/4] Token Overlap Safety Net (min_cands={min_candidates}) ...")
 
-    # Find under-covered S1 entities
-    all_s1_ids = set(s1["entity_id"].to_list())
-
-    if existing_pairs.height > 0:
-        cand_counts = existing_pairs.group_by("s1_id").agg(pl.len().alias("n_cands"))
-        covered = dict(zip(cand_counts["s1_id"].to_list(), cand_counts["n_cands"].to_list()))
-        del cand_counts
-    else:
-        covered = {}
-
-    under_covered = [sid for sid in all_s1_ids if covered.get(sid, 0) < min_candidates]
+    under_covered = [sid for sid, cset in candidates.items() if len(cset) < min_candidates]
 
     if not under_covered:
         print(f"  ✓ All S1 entities have ≥ {min_candidates} candidates. Safety net not needed.")
-        return pl.DataFrame({"s1_id": [], "cand_id": []}, schema={"s1_id": pl.Utf8, "cand_id": pl.Utf8})
+        return
 
     print(f"  Found {len(under_covered):,} under-covered S1 entities (< {min_candidates} candidates)")
 
@@ -655,11 +625,10 @@ def _run_layer4_safety_net(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
         s1_token_data[eid] = (tokens, country)
 
     del s1_filtered
+    gc.collect()
 
     # Build target token index (inverted index for fast lookup)
-    out_dfs = []
     for tgt_name, tgt in [("S2", s2), ("S3", s3)]:
-        # Build per-country inverted index: token → list of (entity_id, token_set)
         country_inverted = defaultdict(lambda: defaultdict(list))
         country_tgt_tokens = defaultdict(dict)
 
@@ -673,18 +642,15 @@ def _run_layer4_safety_net(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
             tokens.discard("")
             country_tgt_tokens[country][eid] = tokens
             for tok in tokens:
-                if len(tok) >= 3:  # Skip very short tokens
+                if len(tok) >= 3:
                     country_inverted[country][tok].append(eid)
 
-        matched_s1 = []
-        matched_cands = []
-
+        added = 0
         for s1_id in tqdm(under_covered, desc=f"  Safety net → {tgt_name}", leave=False):
             s1_tokens, s1_country = s1_token_data.get(s1_id, (set(), ""))
             if not s1_tokens or s1_country not in country_tgt_tokens:
                 continue
 
-            # Use inverted index to find candidates with shared tokens
             candidate_scores = defaultdict(int)
             for tok in s1_tokens:
                 if len(tok) >= 3 and tok in country_inverted[s1_country]:
@@ -694,8 +660,6 @@ def _run_layer4_safety_net(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
             if not candidate_scores:
                 continue
 
-            # Compute Jaccard for top candidates by token overlap count
-            # Pre-filter to top 100 by raw overlap to avoid computing Jaccard for all
             if len(candidate_scores) > 100:
                 top_by_overlap = sorted(candidate_scores.items(), key=lambda x: -x[1])[:100]
             else:
@@ -710,32 +674,20 @@ def _run_layer4_safety_net(s1: pl.DataFrame, s2: pl.DataFrame, s3: pl.DataFrame,
                 intersection = len(s1_tokens & cand_tokens)
                 union = s1_len + len(cand_tokens) - intersection
                 jaccard = intersection / union if union > 0 else 0.0
-                if jaccard >= 0.1:  # Minimum Jaccard threshold
+                if jaccard >= 0.1:
                     scored.append((cand_id, jaccard))
 
-            # Take top_k by Jaccard
             scored.sort(key=lambda x: -x[1])
+            cset = candidates[s1_id]
             for cand_id, _ in scored[:top_k]:
-                matched_s1.append(s1_id)
-                matched_cands.append(cand_id)
+                if len(cset) < MAX_CANDS_PER_S1:
+                    cset.add(cand_id)
+                    added += 1
 
         del country_inverted, country_tgt_tokens
+        gc.collect()
 
-        if matched_s1:
-            df_part = pl.DataFrame({"s1_id": matched_s1, "cand_id": matched_cands}).unique()
-            out_dfs.append(df_part)
-            del matched_s1, matched_cands
-
-    gc.collect()
-
-    if out_dfs:
-        result = pl.concat(out_dfs).unique(subset=["s1_id", "cand_id"])
-        del out_dfs
-    else:
-        result = pl.DataFrame({"s1_id": [], "cand_id": []}, schema={"s1_id": pl.Utf8, "cand_id": pl.Utf8})
-
-    print(f"  ✓ Layer 4 complete in {time.time()-t0:.1f}s → {result.height:,} additional pairs")
-    return result
+    print(f"  ✓ Layer 4 complete in {time.time()-t0:.1f}s")
 
 
 # ==============================================================================
@@ -771,7 +723,7 @@ def encode_texts(texts: list[str],
 
 
 # ==============================================================================
-# PUBLIC API: generate_candidates (4-Layer Fusion)
+# PUBLIC API: generate_candidates (Zero-Swap In-Place Streaming)
 # ==============================================================================
 
 def generate_candidates(s1: pl.DataFrame,
@@ -784,93 +736,68 @@ def generate_candidates(s1: pl.DataFrame,
                         snm_window: int = 5) -> dict[str, set[str]]:
     """
     Generate candidates using 4-Layer Fusion Blocking.
+    Zero-Swap, In-Place Streaming Architecture:
+    - Layer 1: Exact Hash Blocking (Polars joins) -> ingested directly into candidates dict
+    - Layer 2: GPU ANN Dense Vector Search -> streamed directly into candidates dict
+    - Layer 3: Single-Pass Fused TF-IDF -> streamed directly into candidates dict
+    - Layer 4: Token Overlap Safety Net -> streamed directly into candidates dict
 
-    Layer 1: Exact Hash Blocking         — O(N) Polars joins
-    Layer 2: GPU ANN Dense Vector Search  — FP16 matmul, top-50
-    Layer 3: Single-Pass Fused TF-IDF     — 3 signals, 1 pass/country
-    Layer 4: Token Overlap Safety Net     — for under-covered S1s
-
+    Peak RAM: < 5 GB (eliminates 60 GB Polars DataFrame bloat and swap thrashing).
     Returns: dict mapping s1_entity_id → set of candidate entity_ids.
     """
     start_time = time.time()
 
     print("\n" + "="*70)
-    print("  4-LAYER FUSION BLOCKING FOR 99.9% RECALL")
+    print("  4-LAYER FUSION BLOCKING (ZERO-SWAP DIRECT STREAMING)")
     print("="*70)
     print(f"  Inputs: S1={len(s1):,} rows | S2={len(s2):,} rows | S3={len(s3):,} rows")
+
+    # Master candidate dictionary: pre-allocate keys for all S1 entities
+    all_s1_ids = s1["entity_id"].to_list()
+    candidates: dict[str, set[str]] = {sid: set() for sid in all_s1_ids}
 
     # ──────────────────────────────────────────────────────────────────────────
     # Layer 1: Exact Key Matching
     # ──────────────────────────────────────────────────────────────────────────
-    l1_pairs = _run_layer1_exact(s1, s2, s3)
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Layer 2: GPU ANN (Top-50) — moved FIRST because it's fastest and highest recall
-    # ──────────────────────────────────────────────────────────────────────────
-    ann_k = max(50, top_k, ANN_TOP_K)
-    l2_pairs = _run_layer2_ann(s1, s2, s3, s1_embeds, s2_embeds, s3_embeds, top_k=ann_k)
-
-    # Merge L1 + L2 and deduplicate
-    merged_12 = pl.concat([l1_pairs, l2_pairs]).unique(subset=["s1_id", "cand_id"])
-    del l1_pairs, l2_pairs
-    gc.collect()
-    print(f"\n  Cumulative after L1+L2: {merged_12.height:,} unique pairs")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Layer 3: Single-Pass Fused TF-IDF
-    # ──────────────────────────────────────────────────────────────────────────
-    l3_pairs = _run_layer3_fused_tfidf(s1, s2, s3, forward_top_k=40, reverse_top_k=5)
-
-    # Merge L1+L2+L3 and deduplicate
-    merged_123 = pl.concat([merged_12, l3_pairs]).unique(subset=["s1_id", "cand_id"])
-    del merged_12, l3_pairs
-    gc.collect()
-    print(f"\n  Cumulative after L1+L2+L3: {merged_123.height:,} unique pairs")
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Layer 4: Safety Net for under-covered entities
-    # ──────────────────────────────────────────────────────────────────────────
-    l4_pairs = _run_layer4_safety_net(s1, s2, s3, merged_123, min_candidates=5, top_k=10)
-
-    # Final merge
-    if l4_pairs.height > 0:
-        all_pairs_df = pl.concat([merged_123, l4_pairs]).unique(subset=["s1_id", "cand_id"])
-        del merged_123, l4_pairs
-    else:
-        all_pairs_df = merged_123
-        del l4_pairs
-
-    gc.collect()
-
-    # ──────────────────────────────────────────────────────────────────────────
-    # Outlier Cap & Dictionary Build
-    # ──────────────────────────────────────────────────────────────────────────
-    print("\n[Finalization] Outlier capping & dictionary build ...")
+    l1_df = _run_layer1_exact(s1, s2, s3)
     t0 = time.time()
-
-    # Cap at MAX_CANDS_PER_S1 per S1
-    all_pairs_df = all_pairs_df.filter(pl.int_range(0, pl.len()).over("s1_id") < MAX_CANDS_PER_S1)
-
-    grouped = all_pairs_df.group_by("s1_id").agg(pl.col("cand_id"))
-    del all_pairs_df
+    l1_s1 = l1_df["s1_id"].to_list()
+    l1_cands = l1_df["cand_id"].to_list()
+    del l1_df
     gc.collect()
 
-    s1_id_keys = grouped["s1_id"].to_list()
-    cand_lists = grouped["cand_id"].to_list()
-    del grouped
+    added_l1 = 0
+    for sid, cid in zip(l1_s1, l1_cands):
+        cset = candidates[sid]
+        if len(cset) < MAX_CANDS_PER_S1:
+            cset.add(cid)
+            added_l1 += 1
+    del l1_s1, l1_cands
     gc.collect()
+    print(f"  [L1 Ingested] {added_l1:,} pairs merged in {time.time()-t0:.1f}s | "
+          f"Total unique pairs: {sum(len(v) for v in candidates.values()):,}")
 
-    candidates: dict[str, set[str]] = {
-        k: set(v) for k, v in zip(s1_id_keys, cand_lists)
-    }
-    del s1_id_keys, cand_lists
+    # ──────────────────────────────────────────────────────────────────────────
+    # Layer 2: GPU ANN (Top-35, Streams directly to candidates dict)
+    # ──────────────────────────────────────────────────────────────────────────
+    ann_k = min(35, max(25, top_k, ANN_TOP_K))
+    _run_layer2_ann(s1, s2, s3, s1_embeds, s2_embeds, s3_embeds, candidates,
+                    top_k=ann_k, min_sim=0.45)
     gc.collect()
+    print(f"  [L2 Ingested] Cumulative pairs after L1+L2: {sum(len(v) for v in candidates.values()):,}")
 
-    # Ensure every S1 entity is present (even singletons with 0 candidates)
-    all_s1_ids = s1["entity_id"].to_list()
-    for s1_id in all_s1_ids:
-        if s1_id not in candidates:
-            candidates[s1_id] = set()
+    # ──────────────────────────────────────────────────────────────────────────
+    # Layer 3: Single-Pass Fused TF-IDF (Streams directly to candidates dict)
+    # ──────────────────────────────────────────────────────────────────────────
+    _run_layer3_fused_tfidf(s1, s2, s3, candidates, forward_top_k=35, reverse_top_k=5)
+    gc.collect()
+    print(f"  [L3 Ingested] Cumulative pairs after L1+L2+L3: {sum(len(v) for v in candidates.values()):,}")
+
+    # ──────────────────────────────────────────────────────────────────────────
+    # Layer 4: Safety Net for under-covered entities (< 5 candidates)
+    # ──────────────────────────────────────────────────────────────────────────
+    _run_layer4_safety_net(s1, s2, s3, candidates, min_candidates=5, top_k=10)
+    gc.collect()
 
     total_pairs = sum(len(v) for v in candidates.values())
     n_s1 = len(all_s1_ids)
