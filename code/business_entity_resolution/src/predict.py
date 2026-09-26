@@ -150,18 +150,30 @@ def score_candidates(
     chunks = [active_s1_ids[i:i + chunk_size] for i in range(0, len(active_s1_ids), chunk_size)]
 
     # 5. Parallel execution with zero-copy shared memory
-    with ThreadPoolExecutor(max_workers=n_workers) as executor:
-        futures = {
-            executor.submit(_score_chunk, c, candidates, lookup_all, model, threshold=threshold, batch_size=batch_size): i
-            for i, c in enumerate(chunks)
-        }
-        for future in tqdm(as_completed(futures), total=len(chunks), desc="Parallel scoring chunks"):
-            sub_scores = future.result()
-            for sid, cdict in sub_scores.items():
-                if sid in scores:
-                    scores[sid].update(cdict)
-                else:
-                    scores[sid] = cdict
+    orig_n_jobs = getattr(model, "n_jobs", -1)
+    try:
+        model.set_params(n_jobs=1)
+    except Exception:
+        pass
+
+    try:
+        with ThreadPoolExecutor(max_workers=n_workers) as executor:
+            futures = {
+                executor.submit(_score_chunk, c, candidates, lookup_all, model, threshold=threshold, batch_size=batch_size): i
+                for i, c in enumerate(chunks)
+            }
+            for future in tqdm(as_completed(futures), total=len(chunks), desc="Parallel scoring chunks"):
+                sub_scores = future.result()
+                for sid, cdict in sub_scores.items():
+                    if sid in scores:
+                        scores[sid].update(cdict)
+                    else:
+                        scores[sid] = cdict
+    finally:
+        try:
+            model.set_params(n_jobs=orig_n_jobs)
+        except Exception:
+            pass
 
     total_accepted = sum(len(v) for v in scores.values())
     print(f"  Parallel scoring complete! Total accepted matches (prob >= {threshold:.4f}): {total_accepted:,}")
