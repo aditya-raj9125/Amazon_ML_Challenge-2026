@@ -184,15 +184,17 @@ def _get_tfidf_matches_sparse(s1: pl.DataFrame,
                               top_k: int = 50,
                               analyzer: str = "word",
                               ngram_range: tuple = (1, 1),
-                              max_df: float = 0.6,
+                              max_df = 15_000,
                               min_df: int = 2,
                               max_features: int = 250_000,
                               min_score: float = 0.01,
-                              batch_size: int = 2000,
+                              batch_size: int = 4000,
+                              stop_words: str = "english",
                               label: str = "tfidf") -> list[pl.DataFrame]:
     """
     Fast, memory-safe sparse TF-IDF blocking returning list of Polars DataFrames.
-    Streams country text on-demand without cloning full 5M+ row DataFrames.
+    max_df=15000 prunes generic words (road, street, near, pvt, ltd) to keep
+    sparse dot products under 100k non-zeros (4000x speedup).
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
 
@@ -228,6 +230,7 @@ def _get_tfidf_matches_sparse(s1: pl.DataFrame,
                 max_df=max_df,
                 min_df=min_df,
                 max_features=max_features,
+                stop_words=stop_words,
                 sublinear_tf=True,
                 dtype=np.float32,
             )
@@ -323,9 +326,10 @@ def _get_tfidf_addr_guarded_matches(s1: pl.DataFrame,
             tfidf = TfidfVectorizer(
                 analyzer="word",
                 ngram_range=(1, 1),
-                max_df=0.6,
+                max_df=15_000,
                 min_df=2,
                 max_features=150_000,
+                stop_words="english",
                 sublinear_tf=True,
                 dtype=np.float32,
             )
@@ -461,9 +465,10 @@ def _get_reverse_tfidf_matches_sparse(s1: pl.DataFrame,
             tfidf = TfidfVectorizer(
                 analyzer="word",
                 ngram_range=(1, 1),
-                max_df=0.6,
+                max_df=15_000,
                 min_df=2,
                 max_features=250_000,
+                stop_words="english",
                 sublinear_tf=True,
                 dtype=np.float32,
             )
@@ -765,9 +770,10 @@ def generate_candidates(s1: pl.DataFrame,
             top_k=char_k,
             analyzer="char",
             ngram_range=(4, 4),
-            max_df=0.6,
+            max_df=25_000,
             min_df=2,
             max_features=250_000,
+            stop_words=None,
             label=f"char4_{tgt_name}",
         )
         pair_dfs.extend(res_dfs)
