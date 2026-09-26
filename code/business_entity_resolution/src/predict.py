@@ -27,6 +27,7 @@ from config import (
     MODEL_PATH, ARTIFACTS_DIR,
     OUTPUT_DIR, MATCHING_OUT, CANDIDATE_OUT,
     ENABLE_ONE_TO_ONE_DEDUP, ENABLE_GRAPH_PRUNING,
+    INFER_BATCH_SIZE,
 )
 
 
@@ -44,7 +45,7 @@ def score_candidates(
     test_s1_ids: list[str],
     candidates: dict[str, set[str]],
     lookup_all: dict[str, dict],
-    batch_size: int = 100_000,
+    batch_size: int = INFER_BATCH_SIZE,
 ) -> dict[str, dict[str, float]]:
     """
     Score every candidate pair with the LightGBM model.

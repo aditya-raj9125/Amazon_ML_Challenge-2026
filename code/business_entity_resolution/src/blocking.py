@@ -282,8 +282,8 @@ def _add_tfidf_matches(candidates: dict[str, set[str]],
             n_s1 = s1_vecs.shape[0]
             k = min(top_k, tgt_vecs.shape[0])
 
-            # Batch the similarity computation to stay within memory
-            batch_size = max(1, min(5000, int(8e9 / (tgt_vecs.shape[0] * 4))))
+            # Batch the similarity computation to stay within memory (1.5 GB budget for 32 GB RAM)
+            batch_size = max(1, min(2000, int(1.5e9 / (tgt_vecs.shape[0] * 4))))
 
             for b_start in range(0, n_s1, batch_size):
                 b_end = min(b_start + batch_size, n_s1)
@@ -377,7 +377,8 @@ def _add_reverse_tfidf_matches(candidates: dict[str, set[str]],
             n_tgt = tgt_vecs.shape[0]
             k = min(top_k, s1_vecs.shape[0])
 
-            batch_size = max(1, min(10000, int(8e9 / (s1_vecs.shape[0] * 4))))
+            # Batch reverse similarity to stay under 1.5 GB RAM
+            batch_size = max(1, min(2000, int(1.5e9 / (s1_vecs.shape[0] * 4))))
 
             for b_start in range(0, n_tgt, batch_size):
                 b_end = min(b_start + batch_size, n_tgt)
@@ -445,12 +446,12 @@ def _add_ann_matches(candidates: dict[str, set[str]],
                      s1_embeds: np.ndarray,
                      target_embeds: np.ndarray,
                      top_k: int = 30,
-                     max_sim_bytes: int = 2048 * 1024 * 1024):
+                     max_sim_bytes: int = 1024 * 1024 * 1024):
     """
     Search S1 embeddings against target (S2 or S3) partitioned by country.
     Uses PyTorch matrix multiplication & topk with dynamic query batch sizing.
-    Similarity matrix is budgeted up to 2 GB VRAM and queries
-    are staged in contiguous RAM to accelerate vector search.
+    Similarity matrix is budgeted up to 1 GB VRAM (safe for 24 GB NVIDIA A10G)
+    and queries are staged in contiguous memory.
     """
     import torch
 

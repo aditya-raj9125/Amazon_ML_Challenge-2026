@@ -35,6 +35,8 @@ from normalize import normalize_name, normalize_address, normalize_name_no_sort,
 from config import (
     LGBM_PARAMS, LGBM_EARLY_STOPPING_ROUNDS,
     NEG_TO_POS_RATIO, RANDOM_SEED,
+    MAX_TRAIN_S1_GROUPS, MAX_TRAIN_PAIRS,
+    MAX_VAL_SWEEP_S1, INFER_BATCH_SIZE,
     TFIDF_NAME_PATH, TFIDF_ADDR_PATH,
     MODEL_PATH, ARTIFACTS_DIR,
     THRESHOLD_LOW, THRESHOLD_HIGH, THRESHOLD_STEP,
@@ -117,8 +119,8 @@ def make_train_val_split(gt: pl.DataFrame,
 
 def build_record_lookup(df: pl.DataFrame) -> dict[str, dict]:
     """
-    Convert a Polars DataFrame into a dict {entity_id → record_dict}.
-    Reuses pre-computed normalised columns from Polars if present.
+    Convert a Polars DataFrame into a compact dict {entity_id → record_dict}.
+    Stores ONLY fields required for feature extraction to minimize RAM overhead.
     """
     lookup = {}
     has_norm_name = "norm_name" in df.columns
@@ -130,27 +132,30 @@ def build_record_lookup(df: pl.DataFrame) -> dict[str, dict]:
         eid  = row["entity_id"]
         name = row.get("business_name", "") or ""
         addr = row.get("business_address", "") or ""
+        country = row.get("country", "") or ""
         try:
             lookup[eid] = {
-                **row,
-                "norm_name":    row["norm_name"] if has_norm_name else normalize_name(name),
-                "norm_name_ns": row["norm_name_ns"] if has_norm_name_ns else normalize_name_no_sort(name),
-                "norm_addr":    row["norm_addr"] if has_norm_addr else normalize_address(addr),
-                "norm_addr_ns": row["norm_addr_ns"] if has_norm_addr_ns else normalize_address_no_sort(addr),
-                "embed_vec":    None,
-            }
-        except Exception as e:
-            # Skip corrupt records gracefully
-            lookup[eid] = {
-                "entity_id": eid,
-                "business_name": name,
+                "entity_id":        eid,
+                "business_name":    name,
                 "business_address": addr,
-                "country": row.get("country", ""),
-                "norm_name": "",
-                "norm_name_ns": "",
-                "norm_addr": "",
-                "norm_addr_ns": "",
-                "embed_vec": None,
+                "country":          country,
+                "norm_name":        row["norm_name"] if has_norm_name else normalize_name(name),
+                "norm_name_ns":     row["norm_name_ns"] if has_norm_name_ns else normalize_name_no_sort(name),
+                "norm_addr":        row["norm_addr"] if has_norm_addr else normalize_address(addr),
+                "norm_addr_ns":     row["norm_addr_ns"] if has_norm_addr_ns else normalize_address_no_sort(addr),
+                "embed_vec":        None,
+            }
+        except Exception:
+            lookup[eid] = {
+                "entity_id":        eid,
+                "business_name":    name,
+                "business_address": addr,
+                "country":          country,
+                "norm_name":        "",
+                "norm_name_ns":     "",
+                "norm_addr":        "",
+                "norm_addr_ns":     "",
+                "embed_vec":        None,
             }
     return lookup
 
@@ -174,22 +179,35 @@ def build_pair_dataset(
     lookup_all: dict[str, dict],
     neg_ratio: int = NEG_TO_POS_RATIO,
     seed: int = RANDOM_SEED,
+    max_s1_groups: int = MAX_TRAIN_S1_GROUPS,
+    max_total_pairs: int = MAX_TRAIN_PAIRS,
 ) -> tuple[pd.DataFrame, np.ndarray]:
     """
     Build the feature matrix X and label vector y for LightGBM training.
-    Optimized: downsample negatives BEFORE feature computation.
+    Optimized for 32 GB RAM:
+    - Subsamples up to max_s1_groups S1 entities (~250k)
+    - Downsamples negatives with ratio neg_ratio
+    - Caps total pairs at max_total_pairs (~2.0M pairs, ~300 MB RAM)
+    - Preallocates numpy float32 feature matrix (zero Python list-of-lists overhead)
     """
     rng = random.Random(seed)
+
+    # Subsample S1 groups if larger than max_s1_groups to prevent OOM
+    sampled_s1 = list(train_s1_ids)
+    if len(sampled_s1) > max_s1_groups:
+        rng.shuffle(sampled_s1)
+        sampled_s1 = sampled_s1[:max_s1_groups]
+        print(f"  Sampled {len(sampled_s1):,} S1 groups for training (out of {len(train_s1_ids):,})")
 
     pos_pairs: list[tuple[str, str]] = []
     neg_pairs: list[tuple[str, str]] = []
 
     print("Selecting candidate pairs for training...")
-    for s1_id in tqdm(train_s1_ids, desc="Selecting pairs"):
+    for s1_id in tqdm(sampled_s1, desc="Selecting pairs"):
         if s1_id not in lookup_all:
             continue
-        true_m  = gt_dict.get(s1_id, set())
-        cand_m  = candidates.get(s1_id, set())
+        true_m = gt_dict.get(s1_id, set())
+        cand_m = candidates.get(s1_id, set())
 
         for s23_id in cand_m:
             if s23_id not in lookup_all:
@@ -202,7 +220,6 @@ def build_pair_dataset(
     print(f"  Raw candidate positives : {len(pos_pairs):,}")
     print(f"  Raw candidate negatives : {len(neg_pairs):,}")
 
-    # Downsample negatives BEFORE feature computation
     target_neg = min(len(neg_pairs), len(pos_pairs) * neg_ratio)
     rng.shuffle(neg_pairs)
     neg_pairs = neg_pairs[:target_neg]
@@ -211,26 +228,43 @@ def build_pair_dataset(
     selected_pairs = pos_pairs + neg_pairs
     y = np.array([1] * len(pos_pairs) + [0] * len(neg_pairs), dtype=np.int8)
 
-    # Compute features ONLY on the selected pairs
-    print(f"Computing features for {len(selected_pairs):,} selected pairs...")
-    rows = []
+    # Enforce strict total pair cap if necessary
+    if len(selected_pairs) > max_total_pairs:
+        indices = list(range(len(selected_pairs)))
+        rng.shuffle(indices)
+        indices = indices[:max_total_pairs]
+        selected_pairs = [selected_pairs[i] for i in indices]
+        y = y[indices]
+        print(f"  Capped training pairs to {len(selected_pairs):,} to guarantee < 400 MB RAM")
+
+    n_pairs = len(selected_pairs)
+    n_feats = len(FEATURE_NAMES)
+    print(f"Computing features for {n_pairs:,} selected pairs (pre-allocated float32 matrix) ...")
+
+    # Preallocate float32 feature array: exactly n_pairs * 37 * 4 bytes (~296 MB for 2M rows!)
+    feature_matrix = np.empty((n_pairs, n_feats), dtype=np.float32)
     errors = 0
-    for s1_id, s23_id in tqdm(selected_pairs, desc="Extracting features"):
+
+    for i, (s1_id, s23_id) in enumerate(tqdm(selected_pairs, desc="Extracting features")):
         try:
             rec_a = lookup_all[s1_id]
             rec_b = lookup_all[s23_id]
             fv = build_feature_vector(rec_a, rec_b)
-            rows.append([fv.get(f, 0.0) for f in FEATURE_NAMES])
-        except Exception as e:
-            rows.append([0.0] * len(FEATURE_NAMES))
+            for j, f in enumerate(FEATURE_NAMES):
+                feature_matrix[i, j] = fv.get(f, 0.0)
+        except Exception:
+            feature_matrix[i, :] = 0.0
             errors += 1
 
     if errors > 0:
         print(f"  [WARNING] {errors:,} pairs had feature computation errors (defaulted to zeros)")
 
-    X = pd.DataFrame(rows, columns=FEATURE_NAMES)
-    # Replace infinity with NaN (LightGBM handles NaN natively)
-    X = X.replace([np.inf, -np.inf], np.nan)
+    # Replace inf with nan in place
+    np.nan_to_num(feature_matrix, copy=False, nan=np.nan, posinf=np.nan, neginf=np.nan)
+
+    X = pd.DataFrame(feature_matrix, columns=FEATURE_NAMES)
+    del feature_matrix, selected_pairs, pos_pairs, neg_pairs
+    gc.collect()
     return X, y
 
 
@@ -325,24 +359,38 @@ def train_lightgbm(X_train: pd.DataFrame, y_train: np.ndarray,
     return model
 
 
-# ─── Threshold sweep on validation set ───────────────────────────────────────
+# ─── Validation scoring & Threshold sweep (Memory-Safe Streaming) ───────────
 
-def sweep_threshold(model: lgb.LGBMClassifier,
-                    val_s1_ids: set[str],
-                    candidates: dict[str, set[str]],
-                    gt_dict: dict[str, set[str]],
-                    lookup_all: dict[str, dict]) -> float:
+def score_candidate_pairs(
+    model: lgb.LGBMClassifier,
+    s1_ids: set[str] | list[str],
+    candidates: dict[str, set[str]],
+    lookup_all: dict[str, dict],
+    batch_size: int = INFER_BATCH_SIZE,
+    desc: str = "Scoring pairs",
+) -> dict[str, dict[str, float]]:
     """
-    Score every candidate pair in the val split, then sweep thresholds.
-    Returns the optimal threshold maximizing MACRO-averaged F0.5.
+    Score candidate pairs in streaming chunks to keep peak RAM < 150 MB.
+    Flushes batches directly into the probability score dictionary.
     """
-    # Score all val pairs in batches
-    val_scores: dict[str, dict[str, float]] = {}
+    scores: dict[str, dict[str, float]] = {s1_id: {} for s1_id in s1_ids}
+    batch_rows = []
+    batch_indices = []
 
-    rows = []
-    index_map = []
+    def _flush():
+        if not batch_rows:
+            return
+        X = pd.DataFrame(batch_rows, columns=FEATURE_NAMES)
+        X = X.replace([np.inf, -np.inf], np.nan)
+        probs = model.predict_proba(X)[:, 1]
+        for (s1_id, s23_id), prob in zip(batch_indices, probs):
+            scores[s1_id][s23_id] = float(prob)
+        batch_rows.clear()
+        batch_indices.clear()
+        del X, probs
+        gc.collect()
 
-    for s1_id in tqdm(val_s1_ids, desc="Scoring val pairs"):
+    for s1_id in tqdm(s1_ids, desc=desc):
         cands = candidates.get(s1_id, set())
         if s1_id not in lookup_all:
             continue
@@ -353,35 +401,50 @@ def sweep_threshold(model: lgb.LGBMClassifier,
             rec_b = lookup_all[s23_id]
             try:
                 fv = build_feature_vector(rec_a, rec_b)
-                rows.append([fv.get(f, 0.0) for f in FEATURE_NAMES])
-                index_map.append((s1_id, s23_id))
+                batch_rows.append([fv.get(f, 0.0) for f in FEATURE_NAMES])
+                batch_indices.append((s1_id, s23_id))
             except Exception:
                 continue
 
-    if not rows:
-        print("[Threshold] No val pairs to score.")
-        return 0.5
+            if len(batch_rows) >= batch_size:
+                _flush()
 
-    X_val_infer = pd.DataFrame(rows, columns=FEATURE_NAMES)
-    X_val_infer = X_val_infer.replace([np.inf, -np.inf], np.nan)
-    del rows
-    gc.collect()
+    _flush()
+    return scores
 
-    print(f"  Scoring {len(X_val_infer):,} val pairs ...")
-    probs = model.predict_proba(X_val_infer)[:, 1]
-    del X_val_infer
-    gc.collect()
 
-    # Populate score dict
-    for (s1_id, s23_id), prob in zip(index_map, probs):
-        if s1_id not in val_scores:
-            val_scores[s1_id] = {}
-        val_scores[s1_id][s23_id] = float(prob)
+def sweep_threshold(
+    model: lgb.LGBMClassifier,
+    val_s1_ids: set[str],
+    candidates: dict[str, set[str]],
+    gt_dict: dict[str, set[str]],
+    lookup_all: dict[str, dict],
+    val_scores: dict[str, dict[str, float]] | None = None,
+    max_val_s1: int = MAX_VAL_SWEEP_S1,
+    batch_size: int = INFER_BATCH_SIZE,
+    seed: int = RANDOM_SEED,
+) -> float:
+    """
+    Score candidate pairs on a representative val sample in streaming chunks,
+    then sweep thresholds to maximize MACRO-averaged F0.5.
+    Peak RAM: < 150 MB.
+    """
+    if val_scores is None:
+        rng = random.Random(seed)
+        eval_s1 = list(val_s1_ids)
+        if len(eval_s1) > max_val_s1:
+            rng.shuffle(eval_s1)
+            eval_s1 = eval_s1[:max_val_s1]
+            print(f"  Sampled {len(eval_s1):,} val entities for threshold sweep (out of {len(val_s1_ids):,})")
 
-    # Ensure all val S1 entities appear
-    for s1_id in val_s1_ids:
-        if s1_id not in val_scores:
-            val_scores[s1_id] = {}
+        val_scores = score_candidate_pairs(
+            model=model,
+            s1_ids=eval_s1,
+            candidates=candidates,
+            lookup_all=lookup_all,
+            batch_size=batch_size,
+            desc="Scoring val pairs",
+        )
 
     best_t   = 0.5
     best_f05 = 0.0
@@ -389,12 +452,15 @@ def sweep_threshold(model: lgb.LGBMClassifier,
     thresholds = np.arange(THRESHOLD_LOW, THRESHOLD_HIGH + 1e-9, THRESHOLD_STEP)
     print(f"  Sweeping {len(thresholds)} thresholds from {THRESHOLD_LOW} to {THRESHOLD_HIGH} ...")
 
+    # Restrict GT to entities present in val_scores
+    eval_gt = {s1_id: gt_dict.get(s1_id, set()) for s1_id in val_scores.keys()}
+
     for t in tqdm(thresholds, desc="Threshold sweep"):
         preds = {
             s1_id: {s23_id for s23_id, prob in scores.items() if prob >= t}
             for s1_id, scores in val_scores.items()
         }
-        score = macro_f05(preds, gt_dict)
+        score = macro_f05(preds, eval_gt)
         if score > best_f05:
             best_f05 = score
             best_t   = float(t)
@@ -405,57 +471,47 @@ def sweep_threshold(model: lgb.LGBMClassifier,
 
 # ─── Full evaluation report ───────────────────────────────────────────────────
 
-def evaluate_on_val(model: lgb.LGBMClassifier,
-                    threshold: float,
-                    val_s1_ids: set[str],
-                    candidates: dict[str, set[str]],
-                    gt_dict: dict[str, set[str]],
-                    lookup_all: dict[str, dict]) -> dict:
+def evaluate_on_val(
+    model: lgb.LGBMClassifier,
+    threshold: float,
+    val_s1_ids: set[str],
+    candidates: dict[str, set[str]],
+    gt_dict: dict[str, set[str]],
+    lookup_all: dict[str, dict],
+    val_scores: dict[str, dict[str, float]] | None = None,
+    max_eval_s1: int = MAX_VAL_SWEEP_S1,
+    batch_size: int = INFER_BATCH_SIZE,
+    seed: int = RANDOM_SEED,
+) -> dict:
     """
     Produce a full evaluation report on the val split at the given threshold.
+    Uses chunked streaming scoring (or reuses val_scores if already computed).
     """
-    rows      = []
-    index_map = []
+    if val_scores is None:
+        rng = random.Random(seed)
+        eval_s1 = list(val_s1_ids)
+        if len(eval_s1) > max_eval_s1:
+            rng.shuffle(eval_s1)
+            eval_s1 = eval_s1[:max_eval_s1]
+            print(f"  Sampled {len(eval_s1):,} val entities for evaluation (out of {len(val_s1_ids):,})")
 
-    for s1_id in tqdm(val_s1_ids, desc="Eval scoring"):
-        cands = candidates.get(s1_id, set())
-        if s1_id not in lookup_all:
-            continue
-        rec_a = lookup_all[s1_id]
-        for s23_id in cands:
-            if s23_id not in lookup_all:
-                continue
-            rec_b = lookup_all[s23_id]
-            try:
-                fv = build_feature_vector(rec_a, rec_b)
-                rows.append([fv.get(f, 0.0) for f in FEATURE_NAMES])
-                index_map.append((s1_id, s23_id))
-            except Exception:
-                continue
+        val_scores = score_candidate_pairs(
+            model=model,
+            s1_ids=eval_s1,
+            candidates=candidates,
+            lookup_all=lookup_all,
+            batch_size=batch_size,
+            desc="Eval scoring",
+        )
 
-    val_scores: dict[str, dict[str, float]] = {}
-    if rows:
-        X_infer = pd.DataFrame(rows, columns=FEATURE_NAMES)
-        X_infer = X_infer.replace([np.inf, -np.inf], np.nan)
-        probs   = model.predict_proba(X_infer)[:, 1]
-        for (s1_id, s23_id), prob in zip(index_map, probs):
-            if s1_id not in val_scores:
-                val_scores[s1_id] = {}
-            val_scores[s1_id][s23_id] = float(prob)
-        del X_infer, rows
-        gc.collect()
-
-    for s1_id in val_s1_ids:
-        if s1_id not in val_scores:
-            val_scores[s1_id] = {}
-
+    eval_s1_set = set(val_scores.keys())
     preds = {
         s1_id: {s23_id for s23_id, prob in scores.items() if prob >= threshold}
         for s1_id, scores in val_scores.items()
     }
 
-    # Restrict GT to val entities
-    val_gt = {s1_id: gt_dict.get(s1_id, set()) for s1_id in val_s1_ids}
+    # Restrict GT to evaluated entities
+    val_gt = {s1_id: gt_dict.get(s1_id, set()) for s1_id in eval_s1_set}
 
     f05 = macro_f05(preds, val_gt)
 

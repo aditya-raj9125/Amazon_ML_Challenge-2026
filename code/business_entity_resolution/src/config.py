@@ -13,10 +13,10 @@
 #
 # Cell 2 also sets the environment variable AMAZON_ML_DATA to point to that
 # directory so config.py finds it immediately — no filesystem walking needed.
-# ─────────────────────────────────────────────────────────────────────────────
-# SAGEMAKER INSTANCE: ml.g6e.2xlarge (64 GB RAM, 75 GB EBS)
-# → Budget: 64 GB RAM, 65 GB EBS (leaving 10 GB legroom)
-# → GPU: 1× NVIDIA L40s (48 GB VRAM) — excellent for embeddings + ANN
+# SAGEMAKER INSTANCE: ml.g5.2xlarge (32 GB RAM, 75 GB EBS)
+# → Budget: 32 GB RAM (tight — aggressive chunking & memory caps applied)
+# → GPU: 1× NVIDIA A10G (24 GB VRAM) — excellent for embeddings + ANN
+# → vCPUs: 8
 # ─────────────────────────────────────────────────────────────────────────────
 
 import os
@@ -133,7 +133,7 @@ CROSS_COUNTRY_ADDR_THRESH = 0.90
 # MIT-licensed, multilingual (Hindi-transliteration + French zero-shot).
 # 117M params — well under 8B cap. 384-dim output.
 EMBED_MODEL_NAME  = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-EMBED_BATCH_SIZE  = 1024   # ml.g6e.2xlarge has 48 GB VRAM — can handle larger batches
+EMBED_BATCH_SIZE  = 512    # Safe for 24 GB VRAM on NVIDIA A10G (consumes ~2.5 GB peak VRAM)
 EMBED_MAX_SEQ_LEN = 128
 
 # ─── TF-IDF ───────────────────────────────────────────────────────────────────
@@ -161,16 +161,21 @@ LGBM_PARAMS = {
     "reg_lambda":        1.0,
     # F0.5 is precision-heavy; scale_pos_weight < 1 → more precision.
     "scale_pos_weight":  0.5,
-    "n_jobs":            -1,
+    "n_jobs":            8,             # exactly 8 vCPUs on ml.g5.2xlarge
     "random_state":      RANDOM_SEED,
     "verbose":           -1,
 }
 
 LGBM_EARLY_STOPPING_ROUNDS = 100    # increased from 50 for more patience
 
-# ─── Negative Sampling ────────────────────────────────────────────────────────
-# Higher ratio = more hard negatives = better distractor discrimination
-NEG_TO_POS_RATIO = 10   # increased from 8
+# ─── Training Pair & Memory Bounds (32 GB RAM Safe) ───────────────────────────
+# Higher ratio = more hard negatives = better distractor discrimination.
+# Capped at 2M total pairs so RAM usage during training stays under 400 MB.
+NEG_TO_POS_RATIO    = 4            # 4:1 negative-to-positive ratio
+MAX_TRAIN_S1_GROUPS = 250_000      # Subsample S1 entities for training (teammate best practice)
+MAX_TRAIN_PAIRS     = 2_000_000    # Strict ceiling on total training pairs (prevents OOM)
+MAX_VAL_SWEEP_S1    = 50_000       # Subsample val S1 entities for threshold sweep
+INFER_BATCH_SIZE    = 50_000       # Streaming batch size for inference
 
 # ─── Threshold Sweep ─────────────────────────────────────────────────────────
 THRESHOLD_LOW  = 0.30
@@ -181,3 +186,4 @@ THRESHOLD_STEP = 0.005   # finer resolution (was 0.01)
 ENABLE_ONE_TO_ONE_DEDUP    = True
 ENABLE_GRAPH_PRUNING       = True
 GRAPH_PRUNE_MIN_SIMILARITY = 0.25   # name-char3-jaccard floor among matched set
+

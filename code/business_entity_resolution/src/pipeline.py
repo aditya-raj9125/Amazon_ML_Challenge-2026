@@ -252,7 +252,7 @@ def gt_to_dict(gt_df: pl.DataFrame) -> dict[str, set[str]]:
 
 # ─── Embedding helpers ────────────────────────────────────────────────────────
 
-_EMBED_CHUNK_SIZE = 500_000
+_EMBED_CHUNK_SIZE = 250_000
 
 
 def get_or_compute_embeddings(df: pl.DataFrame,
@@ -596,7 +596,7 @@ def stage_train_model(X_train, y_train, val_s1_ids, candidates, gt_dict, lookup_
     rng = random.Random(RANDOM_SEED)
     val_sample = list(val_s1_ids)
     rng.shuffle(val_sample)
-    val_sample = val_sample[:min(50_000, len(val_sample))]
+    val_sample = val_sample[:min(10_000, len(val_sample))]
 
     val_rows   = []
     val_labels = []
@@ -619,10 +619,14 @@ def stage_train_model(X_train, y_train, val_s1_ids, candidates, gt_dict, lookup_
 
     X_val_es = pd.DataFrame(val_rows, columns=FEATURE_NAMES).fillna(0.0)
     y_val_es = np.array(val_labels, dtype=np.int8)
+    del val_rows
+    gc.collect()
     print(f"  Early-stopping val set: {len(X_val_es):,} pairs  "
           f"(positives: {y_val_es.sum():,})")
 
     model = train_lightgbm(X_train, y_train, X_val_es, y_val_es)
+    del X_val_es, y_val_es
+    gc.collect()
     return model
 
 
