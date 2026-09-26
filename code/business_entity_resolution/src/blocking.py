@@ -228,12 +228,12 @@ def _add_ann_matches(candidates: dict[str, set[str]],
                      s1_embeds: np.ndarray,
                      target_embeds: np.ndarray,
                      top_k: int = 30,
-                     max_sim_bytes: int = 512 * 1024 * 1024):
+                     max_sim_bytes: int = 2048 * 1024 * 1024):
     """
     Search S1 embeddings against target (S2 or S3) partitioned by country.
     Uses PyTorch matrix multiplication & topk with dynamic query batch sizing.
-    The similarity matrix is capped at max_sim_bytes (default 512 MB VRAM),
-    completely preventing CUDA OutOfMemoryError.
+    Similarity matrix is budgeted up to 2 GB VRAM (out of 17.4 GB free) and queries
+    are staged in contiguous RAM to accelerate vector search to ~30s per source.
     """
     import torch
 
@@ -264,12 +264,13 @@ def _add_ann_matches(candidates: dict[str, set[str]],
         k = min(top_k, n_tgt)
 
         country_tgt_ids = [tgt_ids[i] for i in tgt_idx_list]
+        country_s1_ids = [s1_ids[i] for i in s1_idx_list]
         tgt_idx_arr = np.array(tgt_idx_list, dtype=np.int64)
         s1_idx_arr = np.array(s1_idx_list, dtype=np.int64)
 
-        # Dynamic query batch size so (batch_size * n_tgt * element_size) <= max_sim_bytes
+        # Dynamic query batch size so (batch_size * n_tgt * element_size) <= max_sim_bytes (~2 GB VRAM)
         elem_bytes = 2 if use_fp16 else 4
-        safe_batch_size = max(32, min(512, int(max_sim_bytes / (n_tgt * elem_bytes))))
+        safe_batch_size = max(64, min(1024, int(max_sim_bytes / (n_tgt * elem_bytes))))
         vram_mb = int(safe_batch_size * n_tgt * elem_bytes / (1024 * 1024))
         print(f"           [{country}] {n_queries:,} queries vs {n_tgt:,} targets (top-{k}, batch={safe_batch_size}, ~{vram_mb} MB VRAM) ...")
 
@@ -288,18 +289,18 @@ def _add_ann_matches(candidates: dict[str, set[str]],
             tgt_t_T = tgt_t.t().contiguous()
             del tgt_t
 
+            # Pre-extract country queries into contiguous RAM to eliminate random disk-mmap reads
+            country_s1_embs = s1_embeds[s1_idx_arr]
+            if use_fp16 and country_s1_embs.dtype != np.float16:
+                country_s1_embs = country_s1_embs.astype(np.float16)
+            elif not use_fp16 and country_s1_embs.dtype != np.float32:
+                country_s1_embs = country_s1_embs.astype(np.float32)
+
             for b_start in range(0, n_queries, safe_batch_size):
                 b_end = min(b_start + safe_batch_size, n_queries)
-                b_indices = s1_idx_arr[b_start:b_end]
-                b_embs = s1_embeds[b_indices]
+                b_embs = country_s1_embs[b_start:b_end]
 
-                if use_fp16:
-                    b_embs_arr = b_embs.astype(np.float16) if b_embs.dtype != np.float16 else b_embs
-                    q_t = torch.from_numpy(b_embs_arr).half().to(device)
-                else:
-                    b_embs_arr = b_embs.astype(np.float32) if b_embs.dtype != np.float32 else b_embs
-                    q_t = torch.from_numpy(b_embs_arr).float().to(device)
-                del b_embs, b_embs_arr
+                q_t = torch.from_numpy(b_embs).to(device)
 
                 # Cosine similarity dot-product: (batch_size, dim) @ (dim, N_tgt) -> (batch_size, N_tgt)
                 sim = torch.mm(q_t, tgt_t_T)
@@ -307,11 +308,11 @@ def _add_ann_matches(candidates: dict[str, set[str]],
                 topk_np = topk_local_idx.cpu().numpy()
                 del sim, q_t, topk_local_idx
 
-                for qi, s1_orig_idx in enumerate(b_indices):
-                    s1_id = s1_ids[s1_orig_idx]
+                for qi in range(b_end - b_start):
+                    s1_id = country_s1_ids[b_start + qi]
                     candidates[s1_id].update(country_tgt_ids[loc] for loc in topk_np[qi] if loc >= 0)
 
-            del tgt_t_T
+            del country_s1_embs, tgt_t_T
             if device.type == "cuda":
                 torch.cuda.empty_cache()
 
